@@ -1148,6 +1148,10 @@ class MSSeparator:
             f"({getattr(model, '_pymss_mlx_full_backend_error', 'unknown error')}); using 'torch'"
         )
         model.mps_model_backend = "torch"
+        params = getattr(model, "parameters", None)
+        first = next(params(), None) if callable(params) else None
+        if first is not None and first.device.type != torch.device(self.device).type:
+            model.to(self.device)  # MLX full loads weights on CPU; move them back for the torch path
 
     def _log_model_config(self, model_type, config, config_path=None, include_config_path=True):
         """Log resolved separator, audio, and model inference settings.

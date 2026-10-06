@@ -894,7 +894,7 @@ def _can_demix_mlx_full(model, device):
     )
 
 
-def _mlx_warmup_audio_length(model):  # dummy length: clears n_fft//2 reflect pad, enough STFT frames for strided segm branches
+def _mlx_warmup_audio_length(model):  # dummy length: clears n_fft//2 reflect pad, enough STFT frames, aligned to model downsampling
     n_fft, hop_length = 2048, 512
     stft_kwargs = getattr(model, "stft_kwargs", None)
     if isinstance(stft_kwargs, dict):
@@ -903,7 +903,20 @@ def _mlx_warmup_audio_length(model):  # dummy length: clears n_fft//2 reflect pa
             hop_length = int(stft_kwargs.get("hop_length", hop_length))
         except (TypeError, ValueError):
             n_fft, hop_length = 2048, 512
-    return max(4 * max(1, n_fft), 64 * max(1, hop_length))
+    else:
+        subband_stft = getattr(model, "stft", None)  # e.g. MDX23C SubbandSTFT object
+        if subband_stft is not None and not isinstance(subband_stft, dict):
+            n_fft = int(getattr(subband_stft, "n_fft", n_fft) or n_fft)
+            hop_length = int(getattr(subband_stft, "hop_length", hop_length) or hop_length)
+    # torch.stft(center=True) yields L//hop + 1 frames; the frame count must
+    # survive the deepest time downsampling exactly so ConvTranspose upscales
+    # can cat with encoder skips (65 frames broke MDX23C: 65->32->64 != 65).
+    # Choose L = (16k - 1) * hop so frames = 16k (divisible by any power-of-two
+    # downsampling stack in-tree), large enough to clear n_fft//2 reflect pad.
+    hop = max(1, hop_length)
+    k = max(1, (4 * max(1, n_fft) + hop - 1) // hop, 4)
+    k += -k % 16 if k % 16 else 0
+    return (16 * k - 1) * hop if 16 * k * hop >= 4 * max(1, n_fft) else (16 * (k + 16) - 1) * hop
 
 
 def _mlx_warmup_channel_candidates(model):  # declared channel first when known, else (2, 1) probe order
@@ -960,12 +973,25 @@ def warmup_mlx_full(model, config):
                 last_error = exc
             except Exception as exc:
                 model._pymss_mlx_full_backend_error = repr(exc)
+                _purge_mlx_full_caches(model)
                 return False
         if last_error is not None:
             model._pymss_mlx_full_backend_error = repr(last_error)
+            _purge_mlx_full_caches(model)
             return False
         clear_mlx_cache()
     return True
+
+
+def _purge_mlx_full_caches(model):  # failed warmup: drop converted weights and allocator buffers so the torch fallback starts clean
+    for module in model.modules():
+        for attr in ("_pymss_mlx_full_param_cache", "_pymss_mlx_attention_cache", "_pymss_mlx_feed_forward_cache", "_pymss_mlx_full_band_split_cache", "_pymss_mlx_full_mask_cache", "_pymss_mlx_compiled_attention_cache", "_pymss_mlx_compiled_feed_forward_cache", "_pymss_mlx_full_mbr_cache"):
+            if hasattr(module, attr):
+                try:
+                    delattr(module, attr)
+                except Exception:
+                    pass
+    clear_mlx_cache()
 
 
 def demix_track_mlx_full(config, model, mix, device, pbar=False, source_indices=None, progress_callback=None):

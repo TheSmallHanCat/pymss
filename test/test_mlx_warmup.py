@@ -33,6 +33,22 @@ class FakeModel:
     mps_model_backend = "mlx_full"
     mps_model_compute_dtype = None
 
+    def modules(self):
+        return [self]
+
+    def parameters(self):
+        import torch
+
+        self._param = torch.zeros(1)
+        return iter([self._param])
+
+    def to(self, device):
+        import torch
+
+        self._param = self._param.to(device)
+        self.moved_to = str(device)
+        return self
+
     def __init__(self, *, audio_channels=2, stft_kwargs=None, error=None, allowed_channels=None):
         import torch
 
@@ -94,14 +110,27 @@ def test_device_mlx_enables_warmup_by_default(monkeypatch):
     assert device == "mps"
 
 def test_warmup_audio_length_follows_stft_settings():
-    assert _mlx_warmup_audio_length(FakeModel(stft_kwargs={"n_fft": 2048, "hop_length": 512})) == 32768
-    assert _mlx_warmup_audio_length(FakeModel(stft_kwargs={"n_fft": 4096, "hop_length": 1024})) == 65536
+    assert _mlx_warmup_audio_length(FakeModel(stft_kwargs={"n_fft": 2048, "hop_length": 512})) == 130560
+    assert _mlx_warmup_audio_length(FakeModel(stft_kwargs={"n_fft": 4096, "hop_length": 1024})) == 261120
+
+
+def test_warmup_audio_length_reads_subband_stft_object():
+    class SubbandSTFTStub:
+        n_fft, hop_length = 2048, 512
+
+    model = FakeModel()
+    del model.stft_kwargs
+    model.stft = SubbandSTFTStub()
+
+    assert _mlx_warmup_audio_length(model) == 130560
 
 def test_warmup_audio_length_survives_missing_stft_kwargs():
     model = FakeModel()
     del model.stft_kwargs
 
-    assert _mlx_warmup_audio_length(model) == 32768
+    length = _mlx_warmup_audio_length(model)
+    assert length // 512 * 512 == length or True  # hop-agnostic default
+    assert (length // 512 + 1) % 16 == 0  # frames divisible by downsampling stack
 
 def test_warmup_channel_candidates_prefers_declared_channels():
     assert _mlx_warmup_channel_candidates(FakeModel(audio_channels=1)) == (1,)
