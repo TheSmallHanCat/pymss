@@ -17,7 +17,8 @@ from .audio_io import downmix_to_stereo, load_audio, save_audio
 from .utils import _resolve_use_amp, clear_mlx_cache, demix, get_model_from_config
 from .logger import get_separation_logger, set_log_level
 from .config import AttrDict, load_config
-from pymss_core import ModelTypeDetectionError, clear_model_runtime_caches, detect_model_type
+from .devices import directml_available, directml_device, inference_context
+from pymss_core import ModelTypeDetectionError, clear_model_runtime_caches, detect_model_type, is_directml_device
 
 
 INFERENCE_PARAM_TARGETS = {
@@ -103,8 +104,8 @@ def _resolve_public_device(device, inference_params, logger):
             raise RuntimeError("device='rocm' requires a ROCm-enabled PyTorch build with a visible HIP device")
         logger.debug("Mapping device='rocm' to device='cuda' (ROCm PyTorch exposes HIP devices as cuda)")
         return "cuda", inference_params
-    if requested_device not in {"auto", "cpu", "cuda", "mps"}:
-        raise ValueError("device must be 'auto', 'cpu', 'cuda', 'mps', 'rocm', or 'mlx'")
+    if requested_device not in {"auto", "cpu", "cuda", "mps", "dml"}:
+        raise ValueError("device must be 'auto', 'cpu', 'cuda', 'mps', 'rocm', 'mlx', or 'dml'")
     return requested_device, inference_params
 
 
@@ -118,6 +119,8 @@ def _select_device(device, device_ids, logger):
 
     Returns:
         Any: Computed result."""
+    if device == "dml":
+        return str(directml_device(device_ids))
     if device not in ["cpu", "mps"]:
         cuda_available = torch.cuda.is_available()
         if device == "cuda" and not cuda_available:
@@ -139,6 +142,9 @@ def _select_device(device, device_ids, logger):
         if torch.backends.mps.is_available():
             logger.debug("Apple Silicon MPS/CoreML is available in Torch, setting Torch device to MPS")
             return "mps"
+        if directml_available():
+            logger.debug("DirectML is available, selecting the requested DX12 adapter")
+            return str(directml_device(device_ids))
         return "cpu"
 
     if device == "cpu":
@@ -717,15 +723,15 @@ class MSSeparator:
             VR models use built-in metadata instead of an MSS YAML config.
             Defaults to None.
         device (str, optional): Runtime device. Valid values are ``auto``,
-            ``cpu``, ``cuda``, ``rocm``, ``mps``, and ``mlx``. ``auto`` chooses CUDA
-            first, then Apple MPS, then CPU. ``rocm`` is a public shortcut for
+            ``cpu``, ``cuda``, ``rocm``, ``mps``, ``mlx``, and ``dml``. ``auto`` chooses
+            CUDA first, then Apple MPS, then installed DirectML, then CPU. ``rocm`` is a public shortcut for
             AMD ROCm GPUs and maps to the ``cuda`` device path (ROCm PyTorch
             exposes HIP devices as ``cuda``). ``mlx`` is a public shortcut for
             Apple Silicon MLX execution through the MPS device path. Defaults
-            to ``"auto"``.
-        device_ids (list[int], optional): CUDA device IDs. Multiple IDs can
+            to ``"auto"``. ``dml`` uses one DX12 adapter in FP32.
+        device_ids (list[int], optional): CUDA device IDs or one DirectML adapter ID. Multiple IDs can
             enable ``torch.nn.DataParallel`` for supported Torch models. This
-            does not select multiple MPS or MLX devices. Defaults to ``[0]``.
+            requires exactly one ID for DirectML and does not select multiple MPS or MLX devices. Defaults to ``[0]``.
         output_format (str, optional): Format used by ``process_folder()`` and
             ``save_audio()``. Supported values are ``wav``, ``flac``, ``mp3``,
             and ``m4a``. Defaults to ``"wav"``.
@@ -830,10 +836,10 @@ class MSSeparator:
             config_path (str | os.PathLike | None, optional): YAML config path.
                 If omitted, pymss tries ``model_path + ".yaml"``. Defaults to
                 None.
-            device (str, optional): ``auto``, ``cpu``, ``cuda``, ``rocm``, ``mps``, or
-                ``mlx``. Defaults to ``"auto"``.
-            device_ids (list[int], optional): CUDA device IDs used when CUDA
-                and DataParallel are available. Defaults to ``[0]``.
+            device (str, optional): ``auto``, ``cpu``, ``cuda``, ``rocm``, ``mps``,
+                ``mlx``, or ``dml``. Defaults to ``"auto"``.
+            device_ids (list[int], optional): CUDA device IDs for DataParallel,
+                or exactly one DirectML adapter ID. Defaults to ``[0]``.
             output_format (str, optional): Saved audio format: ``wav``,
                 ``flac``, ``mp3``, or ``m4a``. Defaults to ``"wav"``.
             use_tta (bool, optional): Enables test-time augmentation. Defaults
@@ -1155,6 +1161,8 @@ class MSSeparator:
             config = AttrDict(config)
             _apply_target_instrument_override(config, self.target_instrument_override, self.logger)
             self.update_inference_params(config, self.inference_params)
+            if is_directml_device(self.device):
+                model.float()
             model = model.to(self.device)
             model.eval()
 
@@ -1188,6 +1196,8 @@ class MSSeparator:
             _coerce_mps_float64(model)
         if torch.device(self.device).type == "cpu":
             _coerce_cpu_low_precision(model)
+        if is_directml_device(self.device):
+            model.float()
 
         keep_torch_model_cpu = _store_torch_model_on_cpu_for_mlx(model, self.device)
         if len(self.device_ids) > 1 and torch.device(self.device).type == "cuda" and not keep_torch_model_cpu:
@@ -1631,7 +1641,9 @@ class MSSeparator:
         Notes:
             When output ``normalize=True``, the shared normalization gain is
             computed only across the returned stems."""
-        return self._separate(mix, pbar=pbar, stems=stems, channel_layout=channel_layout)
+        # Cover device transfers and VR postprocessing outside the model inference scopes.
+        with inference_context(self.device) if is_directml_device(self.device) else nullcontext():
+            return self._separate(mix, pbar=pbar, stems=stems, channel_layout=channel_layout)
 
     def _separate(self, mix, pbar, stems=None, channel_layout=None):
         """Internal separation implementation.

@@ -40,6 +40,21 @@ If you need API or WebUI, install this instead:
 pip install "pymss[server]"
 ```
 
+### Windows DirectML
+
+DirectML is a separate Windows backend for DX12-capable GPUs from AMD, Intel, and NVIDIA. Use a dedicated Python 3.10–3.12 environment: the current `torch-directml` release requires PyTorch 2.4.1 and is incompatible with newer CUDA/ROCm environments.
+
+```bat
+python -m venv .venv-dml
+.venv-dml\Scripts\python -m pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cpu
+.venv-dml\Scripts\python -m pip install "pymss-core[dml] @ git+https://github.com/TheSmallHanCat/pymss-core.git@dml"
+.venv-dml\Scripts\python -m pip install "pymss[dml] @ git+https://github.com/TheSmallHanCat/pymss.git@dml"
+```
+
+For local development, install pymss-core from its `dml` branch first, then run `python -m pip install -e ".[dml]"` inside this repository using the dedicated interpreter.
+
+Pass `device="dml", device_ids=[0]` to `MSSeparator`, or `--device dml --device-id 0` to the CLI. Enumerate adapters with `pymss.devices.directml_devices()`. DirectML selects one adapter, runs neural networks in FP32, and computes unsupported FFT/complex operations on CPU.
+
 ## Develop
 
 Development requires Git, Python 3.10 or later, and [uv](https://docs.astral.sh/uv/). WebUI development also requires Node.js and npm.
@@ -324,7 +339,7 @@ For a detailed explanation of every `MSSeparator` argument, see the [MSSeparator
     'vr']
 - model_path: The path to the model file.
 - config_path: The path to the configuration file.
-- device: The type of device, default is 'auto'. Must be one of ['auto', 'cuda', 'mps', 'cpu']
+- device: The type of device, default is 'auto'. Must be one of ['auto', 'cuda', 'rocm', 'mps', 'mlx', 'dml', 'cpu']
 - device_ids: List of device IDs, default is [0].
 - output_format: The output audio format, default is 'wav'. One of wav, flac, mp3, m4a, aac, opus, vorbis, ogg.
 - use_tta: Whether to use TTA, default is False. Using TTA will triple the processing time with a little bit improvement in quality.
