@@ -894,29 +894,48 @@ def _can_demix_mlx_full(model, device):
     )
 
 
-def _mlx_warmup_audio_length(model):  # dummy length: clears n_fft//2 reflect pad, enough STFT frames, aligned to model downsampling
+def _mlx_warmup_audio_length(model):  # dummy length: clears n_fft//2 reflect pad, enough STFT frames; refinement via _mlx_warmup_length_candidates
     n_fft, hop_length = 2048, 512
     stft_kwargs = getattr(model, "stft_kwargs", None)
     if isinstance(stft_kwargs, dict):
         try:
-            n_fft = int(stft_kwargs.get("n_fft", n_fft))
-            hop_length = int(stft_kwargs.get("hop_length", hop_length))
+            n_fft = int(stft_kwargs.get("n_fft", n_fft)); hop_length = int(stft_kwargs.get("hop_length", hop_length))
         except (TypeError, ValueError):
             n_fft, hop_length = 2048, 512
     else:
         subband_stft = getattr(model, "stft", None)  # e.g. MDX23C SubbandSTFT object
         if subband_stft is not None and not isinstance(subband_stft, dict):
-            n_fft = int(getattr(subband_stft, "n_fft", n_fft) or n_fft)
-            hop_length = int(getattr(subband_stft, "hop_length", hop_length) or hop_length)
-    # torch.stft(center=True) yields L//hop + 1 frames; the frame count must
-    # survive the deepest time downsampling exactly so ConvTranspose upscales
-    # can cat with encoder skips (65 frames broke MDX23C: 65->32->64 != 65).
-    # Choose L = (16k - 1) * hop so frames = 16k (divisible by any power-of-two
-    # downsampling stack in-tree), large enough to clear n_fft//2 reflect pad.
+            n_fft = int(getattr(subband_stft, "n_fft", n_fft) or n_fft); hop_length = int(getattr(subband_stft, "hop_length", hop_length) or hop_length)
+    return max(4 * max(1, n_fft), 64 * max(1, hop_length))
+
+
+def _mlx_warmup_length_candidates(model):  # lengths L whose frame count L//hop+1 survives the time-downsampling stack (65 frames broke MDX23C [2]: 65->32->64; scale=[3,2] needs frames%9: 256 failed, 261 worked)
+    n_fft, hop_length = 2048, 512
+    stft_kwargs = getattr(model, "stft_kwargs", None)
+    if isinstance(stft_kwargs, dict):
+        try:
+            n_fft = int(stft_kwargs.get("n_fft", n_fft)); hop_length = int(stft_kwargs.get("hop_length", hop_length))
+        except (TypeError, ValueError):
+            pass
+    else:
+        subband_stft = getattr(model, "stft", None)
+        if subband_stft is not None and not isinstance(subband_stft, dict):
+            n_fft = int(getattr(subband_stft, "n_fft", n_fft) or n_fft); hop_length = int(getattr(subband_stft, "hop_length", hop_length) or hop_length)
     hop = max(1, hop_length)
-    k = max(1, (4 * max(1, n_fft) + hop - 1) // hop, 4)
-    k += -k % 16 if k % 16 else 0
-    return (16 * k - 1) * hop if 16 * k * hop >= 4 * max(1, n_fft) else (16 * (k + 16) - 1) * hop
+    base = max(4 * max(1, n_fft) // hop, 64)
+    moduli = []
+    scale = getattr(model, "mdx_scale", None)  # time-downsampling stack, e.g. [3, 2]
+    if isinstance(scale, (list, tuple)) and scale:
+        moduli.append(int(scale[0]) ** 2)  # measured on real nets: [3,2]->9, [2,2]->4, [4,2]->16
+    moduli.append(16)
+    out, seen = [], set()
+    for m in moduli:  # order matters: scale-aligned candidates are probed before the power-of-two fallback
+        k = base + (-base % m)
+        for i in range(3):
+            L = (k + m * i - 1) * hop
+            if L >= 4 * max(1, n_fft) and L not in seen:
+                seen.add(L); out.append(L)
+    return tuple(out)
 
 
 def _mlx_warmup_channel_candidates(model):  # declared channel first when known, else (2, 1) probe order
@@ -952,11 +971,13 @@ def warmup_mlx_full(model, config):
     mx_dtype = mx.float16 if compute_dtype == torch.float16 else mx.float32
     batch_size = max(1, int(config.inference.get("batch_size", 1) or 1))
     chunk_size = config.audio.get("chunk_size", config.inference.get("chunk_size", None))
-    phases = [(1, _mlx_warmup_audio_length(model))]
+    phases = [(1, length) for length in _mlx_warmup_length_candidates(model)]
     if chunk_size:
         phases.append((batch_size, int(chunk_size)))
 
-    for phase_batch, phase_length in phases:
+    last_phase_index = len(phases) - 1
+    for phase_index, (phase_batch, phase_length) in enumerate(phases):
+        tiny_phase = phase_index < last_phase_index
         if phase_length <= 0:
             continue
         last_error = None
@@ -976,16 +997,34 @@ def warmup_mlx_full(model, config):
                 _purge_mlx_full_caches(model)
                 return False
         if last_error is not None:
-            model._pymss_mlx_full_backend_error = repr(last_error)
-            _purge_mlx_full_caches(model)
-            return False
+            if not tiny_phase:
+                model._pymss_mlx_full_backend_error = repr(last_error)
+                _purge_mlx_full_caches(model)
+                return False
+            continue  # tiny phase: try the next candidate length
         clear_mlx_cache()
-    return True
+        if tiny_phase:
+            break  # first successful tiny length is enough; the real-shape phase follows below
+    for phase_index, (phase_batch, phase_length) in enumerate(phases[1:], start=1) if chunk_size else []:
+        if phase_length <= 0 or phase_index < len(phases) - 1:
+            continue  # skip remaining tiny candidates; only the real-shape phase runs here
+        for channels in _mlx_warmup_channel_candidates(model):
+            try:
+                _mlx_warmup_forward(model, phase_batch, channels, phase_length, mx_dtype)
+                clear_mlx_cache()
+                return True
+            except NotImplementedError:
+                return False
+            except Exception as exc:
+                model._pymss_mlx_full_backend_error = repr(exc)
+                _purge_mlx_full_caches(model)
+                return False
+    return not chunk_size
 
 
 def _purge_mlx_full_caches(model):  # failed warmup: drop converted weights and allocator buffers so the torch fallback starts clean
     for module in model.modules():
-        for attr in ("_pymss_mlx_full_param_cache", "_pymss_mlx_attention_cache", "_pymss_mlx_feed_forward_cache", "_pymss_mlx_full_band_split_cache", "_pymss_mlx_full_mask_cache", "_pymss_mlx_compiled_attention_cache", "_pymss_mlx_compiled_feed_forward_cache", "_pymss_mlx_full_mbr_cache"):
+        for attr in ("_pymss_mlx_full_param_cache", "_pymss_mlx_attention_cache", "_pymss_mlx_feed_forward_cache", "_pymss_mlx_full_band_split_cache", "_pymss_mlx_full_mask_cache", "_pymss_mlx_compiled_attention_cache", "_pymss_mlx_compiled_feed_forward_cache", "_pymss_mlx_full_mbr_cache", "_pymss_mlx_norm_cache", "_pymss_mlx_cos_sin_cache"):
             if hasattr(module, attr):
                 try:
                     delattr(module, attr)

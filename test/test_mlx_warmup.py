@@ -9,6 +9,7 @@ from pymss.separator import _prefer_mlx_for_auto, _resolve_public_device
 from pymss.utils import (
     _mlx_warmup_audio_length,
     _mlx_warmup_channel_candidates,
+    _mlx_warmup_length_candidates,
     warmup_mlx_full,
 )
 
@@ -39,14 +40,12 @@ class FakeModel:
     def parameters(self):
         import torch
 
-        self._param = torch.zeros(1)
+        if not hasattr(self, "_param"):
+            self._param = torch.zeros(1)  # stays on CPU: never actually moved, `to` is recorded only
         return iter([self._param])
 
     def to(self, device):
-        import torch
-
-        self._param = self._param.to(device)
-        self.moved_to = str(device)
+        self.moved_to = str(device)  # mock the move; real tensor.to("mps") is unavailable on non-Apple platforms
         return self
 
     def __init__(self, *, audio_channels=2, stft_kwargs=None, error=None, allowed_channels=None):
@@ -110,8 +109,8 @@ def test_device_mlx_enables_warmup_by_default(monkeypatch):
     assert device == "mps"
 
 def test_warmup_audio_length_follows_stft_settings():
-    assert _mlx_warmup_audio_length(FakeModel(stft_kwargs={"n_fft": 2048, "hop_length": 512})) == 130560
-    assert _mlx_warmup_audio_length(FakeModel(stft_kwargs={"n_fft": 4096, "hop_length": 1024})) == 261120
+    assert _mlx_warmup_audio_length(FakeModel(stft_kwargs={"n_fft": 2048, "hop_length": 512})) == 32768
+    assert _mlx_warmup_audio_length(FakeModel(stft_kwargs={"n_fft": 4096, "hop_length": 1024})) == 65536
 
 
 def test_warmup_audio_length_reads_subband_stft_object():
@@ -122,15 +121,14 @@ def test_warmup_audio_length_reads_subband_stft_object():
     del model.stft_kwargs
     model.stft = SubbandSTFTStub()
 
-    assert _mlx_warmup_audio_length(model) == 130560
+    assert _mlx_warmup_audio_length(model) == 32768
 
 def test_warmup_audio_length_survives_missing_stft_kwargs():
     model = FakeModel()
     del model.stft_kwargs
 
-    length = _mlx_warmup_audio_length(model)
-    assert length // 512 * 512 == length or True  # hop-agnostic default
-    assert (length // 512 + 1) % 16 == 0  # frames divisible by downsampling stack
+    cands = _mlx_warmup_length_candidates(model)
+    assert cands and all((L // 512 + 1) % 16 == 0 for L in cands)
 
 def test_warmup_channel_candidates_prefers_declared_channels():
     assert _mlx_warmup_channel_candidates(FakeModel(audio_channels=1)) == (1,)
@@ -147,7 +145,7 @@ def test_warmup_runs_both_phases_with_real_shapes(fake_mlx):
 
     assert warmup_mlx_full(model, _config(chunk_size=960000, batch_size=2)) is True
 
-    tiny_length = _mlx_warmup_audio_length(model)
+    tiny_length = _mlx_warmup_length_candidates(model)[0]
     assert model.calls == [(1, 2, tiny_length), (2, 2, 960000)]
     assert fake.zero_shapes == [((1, 2, tiny_length), "float16"), ((2, 2, 960000), "float16")]
     assert fake.eval_calls == 2
@@ -160,7 +158,7 @@ def test_warmup_skips_real_shape_phase_without_chunk_size(fake_mlx):
 
     assert warmup_mlx_full(model, _config(chunk_size=None, batch_size=2)) is True
 
-    assert len(model.calls) == 1
+    assert len(model.calls) == 1  # first successful tiny length stops the probe
     assert len(cleared) == 1
 
 def test_warmup_probes_channel_count_on_value_error(fake_mlx):
@@ -169,7 +167,7 @@ def test_warmup_probes_channel_count_on_value_error(fake_mlx):
 
     assert warmup_mlx_full(model, _config(chunk_size=None)) is True
 
-    assert [shape[1] for shape in model.calls] == [2, 1]
+    assert [shape[1] for shape in model.calls] == [2, 1]  # channel probe order on the first candidate
 
 def test_warmup_records_error_and_returns_false(fake_mlx):
     model = FakeModel(error=RuntimeError("metal exploded"))
