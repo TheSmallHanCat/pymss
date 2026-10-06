@@ -894,7 +894,7 @@ def _can_demix_mlx_full(model, device):
     )
 
 
-def _mlx_warmup_audio_length(model):  # dummy length: clears n_fft//2 reflect pad, enough STFT frames; refinement via _mlx_warmup_length_candidates
+def _mlx_warmup_audio_length(model):  # base dummy length
     n_fft, hop_length = 2048, 512
     stft_kwargs = getattr(model, "stft_kwargs", None)
     if isinstance(stft_kwargs, dict):
@@ -909,7 +909,7 @@ def _mlx_warmup_audio_length(model):  # dummy length: clears n_fft//2 reflect pa
     return max(4 * max(1, n_fft), 64 * max(1, hop_length))
 
 
-def _mlx_warmup_length_candidates(model):  # lengths L whose frame count L//hop+1 survives the time-downsampling stack (65 frames broke MDX23C [2]: 65->32->64; scale=[3,2] needs frames%9: 256 failed, 261 worked)
+def _mlx_warmup_length_candidates(model):  # align STFT frames to encoder strides
     n_fft, hop_length = 2048, 512
     stft_kwargs = getattr(model, "stft_kwargs", None)
     if isinstance(stft_kwargs, dict):
@@ -922,20 +922,17 @@ def _mlx_warmup_length_candidates(model):  # lengths L whose frame count L//hop+
         if subband_stft is not None and not isinstance(subband_stft, dict):
             n_fft = int(getattr(subband_stft, "n_fft", n_fft) or n_fft); hop_length = int(getattr(subband_stft, "hop_length", hop_length) or hop_length)
     hop = max(1, hop_length)
-    base = max(4 * max(1, n_fft) // hop, 64)
-    moduli = []
-    scale = getattr(model, "mdx_scale", None)  # time-downsampling stack, e.g. [3, 2]
-    if isinstance(scale, (list, tuple)) and scale:
-        moduli.append(int(scale[0]) ** 2)  # measured on real nets: [3,2]->9, [2,2]->4, [4,2]->16
-    moduli.append(16)
-    out, seen = [], set()
-    for m in moduli:  # order matters: scale-aligned candidates are probed before the power-of-two fallback
-        k = base + (-base % m)
-        for i in range(3):
-            L = (k + m * i - 1) * hop
-            if L >= 4 * max(1, n_fft) and L not in seen:
-                seen.add(L); out.append(L)
-    return tuple(out)
+    base = max((4 * max(1, n_fft) + hop - 1) // hop + 1, 64)
+    multiple = 1
+    for block in getattr(model, "encoder_blocks", ()):
+        downscale = getattr(block, "downscale", None)
+        if downscale is not None:
+            for layer in downscale.modules():
+                if isinstance(layer, nn.Conv2d):
+                    multiple *= layer.stride[0]  # MDX time axis
+    multiple = multiple if multiple > 1 else 16
+    frames = base + (-base % multiple)
+    return tuple((frames + multiple * i - 1) * hop for i in range(3))
 
 
 def _mlx_warmup_channel_candidates(model):  # declared channel first when known, else (2, 1) probe order
@@ -955,12 +952,7 @@ def _mlx_warmup_forward(model, batch_size, channels, length, dtype):  # one thro
 
 
 def warmup_mlx_full(model, config):
-    # The MLX full path is lazy: the first forward would convert every fp32 weight,
-    # build shape-keyed kernels and evaluate the whole graph inside the first real
-    # batch, interleaving the weight arena with the largest transients. Pay those
-    # one-time costs at load time instead: (1) tiny input materializes weight caches,
-    # (2) real (batch, chunk) input builds kernels and warms the allocator. Failures
-    # land on _pymss_mlx_full_backend_error for the caller's torch fallback.
+    # Materialize weights, then warm the real batch shape once.
     try:
         import mlx.core as mx
     except Exception as exc:
@@ -971,55 +963,43 @@ def warmup_mlx_full(model, config):
     mx_dtype = mx.float16 if compute_dtype == torch.float16 else mx.float32
     batch_size = max(1, int(config.inference.get("batch_size", 1) or 1))
     chunk_size = config.audio.get("chunk_size", config.inference.get("chunk_size", None))
-    phases = [(1, length) for length in _mlx_warmup_length_candidates(model)]
-    if chunk_size:
-        phases.append((batch_size, int(chunk_size)))
+    channel_candidates = _mlx_warmup_channel_candidates(model)
+    selected_channels, last_error = None, None
 
-    last_phase_index = len(phases) - 1
-    for phase_index, (phase_batch, phase_length) in enumerate(phases):
-        tiny_phase = phase_index < last_phase_index
-        if phase_length <= 0:
-            continue
-        last_error = None
-        for channels in _mlx_warmup_channel_candidates(model):
-            try:
-                _mlx_warmup_forward(model, phase_batch, channels, phase_length, mx_dtype)
-                last_error = None
+    try:
+        for length in _mlx_warmup_length_candidates(model):
+            for channels in channel_candidates:
+                try:
+                    _mlx_warmup_forward(model, 1, channels, length, mx_dtype)
+                except ValueError as exc:
+                    last_error = exc
+                    continue
+                selected_channels = channels
+                clear_mlx_cache()
                 break
-            except NotImplementedError:
-                # Models such as the PoPE variants opt out of the MLX full
-                # backend by design; leave the torch fallback untouched.
-                return False
-            except ValueError as exc:
-                last_error = exc
-            except Exception as exc:
-                model._pymss_mlx_full_backend_error = repr(exc)
-                _purge_mlx_full_caches(model)
-                return False
-        if last_error is not None:
-            if not tiny_phase:
-                model._pymss_mlx_full_backend_error = repr(last_error)
-                _purge_mlx_full_caches(model)
-                return False
-            continue  # tiny phase: try the next candidate length
-        clear_mlx_cache()
-        if tiny_phase:
-            break  # first successful tiny length is enough; the real-shape phase follows below
-    for phase_index, (phase_batch, phase_length) in enumerate(phases[1:], start=1) if chunk_size else []:
-        if phase_length <= 0 or phase_index < len(phases) - 1:
-            continue  # skip remaining tiny candidates; only the real-shape phase runs here
-        for channels in _mlx_warmup_channel_candidates(model):
-            try:
-                _mlx_warmup_forward(model, phase_batch, channels, phase_length, mx_dtype)
+            if selected_channels is not None:
+                break
+
+        if chunk_size:
+            channels_to_try = (selected_channels,) if selected_channels is not None else channel_candidates
+            for channels in channels_to_try:
+                try:
+                    _mlx_warmup_forward(model, batch_size, channels, int(chunk_size), mx_dtype)
+                except ValueError as exc:
+                    last_error = exc
+                    continue
                 clear_mlx_cache()
                 return True
-            except NotImplementedError:
-                return False
-            except Exception as exc:
-                model._pymss_mlx_full_backend_error = repr(exc)
-                _purge_mlx_full_caches(model)
-                return False
-    return not chunk_size
+        elif selected_channels is not None:
+            return True
+        raise last_error or ValueError("no compatible MLX warmup input")
+    except NotImplementedError:
+        _purge_mlx_full_caches(model)
+        return False
+    except Exception as exc:
+        model._pymss_mlx_full_backend_error = repr(exc)
+        _purge_mlx_full_caches(model)
+        return False
 
 
 def _purge_mlx_full_caches(model):  # failed warmup: drop converted weights and allocator buffers so the torch fallback starts clean

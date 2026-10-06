@@ -48,7 +48,7 @@ class FakeModel:
         self.moved_to = str(device)  # mock the move; real tensor.to("mps") is unavailable on non-Apple platforms
         return self
 
-    def __init__(self, *, audio_channels=2, stft_kwargs=None, error=None, allowed_channels=None):
+    def __init__(self, *, audio_channels=2, stft_kwargs=None, error=None, allowed_channels=None, allowed_lengths=None):
         import torch
 
         self.audio_channels = audio_channels
@@ -56,6 +56,7 @@ class FakeModel:
         self.mps_model_compute_dtype = torch.float16
         self.error = error
         self.allowed_channels = allowed_channels
+        self.allowed_lengths = allowed_lengths
         self.calls = []
 
     def mlx_forward_mx(self, raw_audio):
@@ -64,6 +65,8 @@ class FakeModel:
             raise self.error
         if self.allowed_channels is not None and raw_audio.shape[1] not in self.allowed_channels:
             raise ValueError("raw_audio channel count does not match RoFormer stereo setting")
+        if self.allowed_lengths is not None and raw_audio.shape[-1] not in self.allowed_lengths:
+            raise ValueError("incompatible STFT frame count")
         return raw_audio
 
 @pytest.fixture()
@@ -130,6 +133,53 @@ def test_warmup_audio_length_survives_missing_stft_kwargs():
     cands = _mlx_warmup_length_candidates(model)
     assert cands and all((L // 512 + 1) % 16 == 0 for L in cands)
 
+@pytest.mark.parametrize("scale,num_scales", [((3, 2), 2), ((3, 2), 5), ((2, 2), 4), ((4, 2), 2)])
+def test_warmup_aligns_to_full_mdx_encoder(fake_mlx, monkeypatch, scale, num_scales):
+    import torch
+    from pymss_core.modules.mdx23c_tfc_tdf_v3 import TFC_TDF_net
+
+    config = AttrDict({
+        "audio": {"n_fft": 2048, "hop_length": 512, "dim_f": 2 * scale[1] ** num_scales, "num_channels": 2},
+        "model": {"num_subbands": 1, "num_scales": num_scales, "scale": scale, "num_blocks_per_scale": 1,
+                  "num_channels": 4, "growth": 4, "bottleneck_factor": 2, "norm": "none", "act": "relu"},
+        "training": {"instruments": ["vocals"], "target_instrument": "vocals"},
+    })
+    model = TFC_TDF_net(config).eval()
+    lengths = _mlx_warmup_length_candidates(model)
+    frames = [length // model.stft.hop_length + 1 for length in lengths]
+    assert frames and all(count % (scale[0] ** num_scales) == 0 for count in frames)
+    if scale == (3, 2) and num_scales == 5:
+        assert frames[0] == 243
+    calls = []
+
+    def forward(raw_audio):
+        calls.append(tuple(raw_audio.shape))
+        count = raw_audio.shape[-1] // model.stft.hop_length + 1
+        x = torch.zeros(raw_audio.shape[0], config.model.num_channels, count, model.stft.dim_f)
+        with torch.inference_mode():
+            y = model._forward_core(x)
+        assert y.shape == x.shape
+        return raw_audio
+
+    monkeypatch.setattr(model, "mlx_forward_mx", forward)
+    assert warmup_mlx_full(model, _config(chunk_size=None)) is True
+    assert len(calls) == 1
+    assert calls[0][-1] == lengths[0]
+
+
+def test_warmup_alignment_uses_each_downscale_stride():
+    import torch.nn as nn
+
+    model = FakeModel()
+    model.encoder_blocks = [
+        SimpleNamespace(downscale=nn.Sequential(nn.Identity(), nn.Conv2d(1, 1, (stride, 2), stride=(stride, 2))))
+        for stride in (2, 3, 5)
+    ]
+    model.mdx_scale = [3, 2]
+    lengths = _mlx_warmup_length_candidates(model)
+    assert lengths and all((length // 512 + 1) % 30 == 0 for length in lengths)
+
+
 def test_warmup_channel_candidates_prefers_declared_channels():
     assert _mlx_warmup_channel_candidates(FakeModel(audio_channels=1)) == (1,)
     assert _mlx_warmup_channel_candidates(FakeModel(audio_channels=2)) == (2,)
@@ -168,6 +218,47 @@ def test_warmup_probes_channel_count_on_value_error(fake_mlx):
     assert warmup_mlx_full(model, _config(chunk_size=None)) is True
 
     assert [shape[1] for shape in model.calls] == [2, 1]  # channel probe order on the first candidate
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_warmup_runs_real_shape_once_after_short_probe_exhaustion(fake_mlx, batch_size):
+    fake, cleared = fake_mlx
+    model = FakeModel(allowed_lengths=(960000,))
+    lengths = _mlx_warmup_length_candidates(model)
+
+    assert warmup_mlx_full(model, _config(batch_size=batch_size)) is True
+    assert model.calls == [(1, 2, length) for length in lengths] + [(batch_size, 2, 960000)]
+    assert fake.eval_calls == 1
+    assert len(cleared) == 1
+    assert model.mps_model_backend == "mlx_full"
+    assert not hasattr(model, "_pymss_mlx_full_backend_error")
+
+
+def test_warmup_short_probe_exhaustion_without_real_shape_fails(fake_mlx):
+    _, cleared = fake_mlx
+    model = FakeModel(allowed_lengths=())
+
+    assert warmup_mlx_full(model, _config(chunk_size=None)) is False
+    assert "STFT frame count" in model._pymss_mlx_full_backend_error
+    assert len(cleared) == 1
+
+
+def test_warmup_real_shape_error_is_not_retried(fake_mlx, monkeypatch):
+    _, cleared = fake_mlx
+    model = FakeModel(allowed_lengths=())
+    original = model.mlx_forward_mx
+
+    def forward(raw_audio):
+        if raw_audio.shape[-1] == 960000:
+            model.calls.append(tuple(raw_audio.shape))
+            raise RuntimeError("metal exploded")
+        return original(raw_audio)
+
+    monkeypatch.setattr(model, "mlx_forward_mx", forward)
+    assert warmup_mlx_full(model, _config()) is False
+    assert [shape for shape in model.calls if shape[-1] == 960000] == [(2, 2, 960000)]
+    assert "metal exploded" in model._pymss_mlx_full_backend_error
+    assert len(cleared) == 1
+
 
 def test_warmup_records_error_and_returns_false(fake_mlx):
     model = FakeModel(error=RuntimeError("metal exploded"))
