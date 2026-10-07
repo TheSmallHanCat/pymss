@@ -802,29 +802,7 @@ def _mlx_fit_length(x, length):
     return x
 
 
-@contextmanager
-def _mlx_clear_cache_after_eval(enabled=False):
-    """Clear MLX allocator cache after explicit eval points when requested."""
-    if not enabled:
-        yield
-        return
-    import mlx.core as mx
-
-    original_eval = mx.eval
-
-    def eval_and_clear(*args, **kwargs):
-        result = original_eval(*args, **kwargs)
-        clear_mlx_cache()
-        return result
-
-    mx.eval = eval_and_clear
-    try:
-        yield
-    finally:
-        mx.eval = original_eval
-
-
-def _mlx_run_model_chunk(model, arr, chunk_size, clear_cache_after_eval=False):
+def _mlx_run_model_chunk(model, arr, chunk_size):
     """Implement the mlx run model chunk helper.
 
     Args:
@@ -834,8 +812,7 @@ def _mlx_run_model_chunk(model, arr, chunk_size, clear_cache_after_eval=False):
 
     Returns:
         Any: Computed result."""
-    with _mlx_clear_cache_after_eval(clear_cache_after_eval):
-        y = model.mlx_forward_mx(arr)
+    y = model.mlx_forward_mx(arr)
     if y.ndim == arr.ndim:
         y = y[:, None]
     return _mlx_fit_length(y, chunk_size)
@@ -917,6 +894,125 @@ def _can_demix_mlx_full(model, device):
     )
 
 
+def _mlx_warmup_audio_length(model):  # base dummy length
+    n_fft, hop_length = 2048, 512
+    stft_kwargs = getattr(model, "stft_kwargs", None)
+    if isinstance(stft_kwargs, dict):
+        try:
+            n_fft = int(stft_kwargs.get("n_fft", n_fft)); hop_length = int(stft_kwargs.get("hop_length", hop_length))
+        except (TypeError, ValueError):
+            n_fft, hop_length = 2048, 512
+    else:
+        subband_stft = getattr(model, "stft", None)  # e.g. MDX23C SubbandSTFT object
+        if subband_stft is not None and not isinstance(subband_stft, dict):
+            n_fft = int(getattr(subband_stft, "n_fft", n_fft) or n_fft); hop_length = int(getattr(subband_stft, "hop_length", hop_length) or hop_length)
+    return max(4 * max(1, n_fft), 64 * max(1, hop_length))
+
+
+def _mlx_warmup_length_candidates(model):  # align STFT frames to encoder strides
+    n_fft, hop_length = 2048, 512
+    stft_kwargs = getattr(model, "stft_kwargs", None)
+    if isinstance(stft_kwargs, dict):
+        try:
+            n_fft = int(stft_kwargs.get("n_fft", n_fft)); hop_length = int(stft_kwargs.get("hop_length", hop_length))
+        except (TypeError, ValueError):
+            pass
+    else:
+        subband_stft = getattr(model, "stft", None)
+        if subband_stft is not None and not isinstance(subband_stft, dict):
+            n_fft = int(getattr(subband_stft, "n_fft", n_fft) or n_fft); hop_length = int(getattr(subband_stft, "hop_length", hop_length) or hop_length)
+    hop = max(1, hop_length)
+    base = max((4 * max(1, n_fft) + hop - 1) // hop + 1, 64)
+    multiple = 1
+    for block in getattr(model, "encoder_blocks", ()):
+        downscale = getattr(block, "downscale", None)
+        if downscale is not None:
+            for layer in downscale.modules():
+                if isinstance(layer, nn.Conv2d):
+                    multiple *= layer.stride[0]  # MDX time axis
+    multiple = multiple if multiple > 1 else 16
+    frames = base + (-base % multiple)
+    return tuple((frames + multiple * i - 1) * hop for i in range(3))
+
+
+def _mlx_warmup_channel_candidates(model):  # declared channel first when known, else (2, 1) probe order
+    channels = getattr(model, "audio_channels", None)
+    if channels in (1, 2):
+        return (int(channels),)
+    return (2, 1)
+
+
+def _mlx_warmup_forward(model, batch_size, channels, length, dtype):  # one throwaway forward: output dropped, backend caches kept
+    import mlx.core as mx
+
+    dummy = mx.zeros((batch_size, channels, length), dtype=dtype)
+    result = model.mlx_forward_mx(dummy)
+    mx.eval(result)
+    del result, dummy
+
+
+def warmup_mlx_full(model, config):
+    # Materialize weights, then warm the real batch shape once.
+    try:
+        import mlx.core as mx
+    except Exception as exc:
+        model._pymss_mlx_full_backend_error = repr(exc)
+        return False
+
+    compute_dtype = getattr(model, "mps_model_compute_dtype", torch.float16)
+    mx_dtype = mx.float16 if compute_dtype == torch.float16 else mx.float32
+    batch_size = max(1, int(config.inference.get("batch_size", 1) or 1))
+    chunk_size = config.audio.get("chunk_size", config.inference.get("chunk_size", None))
+    channel_candidates = _mlx_warmup_channel_candidates(model)
+    selected_channels, last_error = None, None
+
+    try:
+        for length in _mlx_warmup_length_candidates(model):
+            for channels in channel_candidates:
+                try:
+                    _mlx_warmup_forward(model, 1, channels, length, mx_dtype)
+                except ValueError as exc:
+                    last_error = exc
+                    continue
+                selected_channels = channels
+                clear_mlx_cache()
+                break
+            if selected_channels is not None:
+                break
+
+        if chunk_size:
+            channels_to_try = (selected_channels,) if selected_channels is not None else channel_candidates
+            for channels in channels_to_try:
+                try:
+                    _mlx_warmup_forward(model, batch_size, channels, int(chunk_size), mx_dtype)
+                except ValueError as exc:
+                    last_error = exc
+                    continue
+                clear_mlx_cache()
+                return True
+        elif selected_channels is not None:
+            return True
+        raise last_error or ValueError("no compatible MLX warmup input")
+    except NotImplementedError:
+        _purge_mlx_full_caches(model)
+        return False
+    except Exception as exc:
+        model._pymss_mlx_full_backend_error = repr(exc)
+        _purge_mlx_full_caches(model)
+        return False
+
+
+def _purge_mlx_full_caches(model):  # failed warmup: drop converted weights and allocator buffers so the torch fallback starts clean
+    for module in model.modules():
+        for attr in ("_pymss_mlx_full_param_cache", "_pymss_mlx_attention_cache", "_pymss_mlx_feed_forward_cache", "_pymss_mlx_full_band_split_cache", "_pymss_mlx_full_mask_cache", "_pymss_mlx_compiled_attention_cache", "_pymss_mlx_compiled_feed_forward_cache", "_pymss_mlx_full_mbr_cache", "_pymss_mlx_norm_cache", "_pymss_mlx_cos_sin_cache"):
+            if hasattr(module, attr):
+                try:
+                    delattr(module, attr)
+                except Exception:
+                    pass
+    clear_mlx_cache()
+
+
 def demix_track_mlx_full(config, model, mix, device, pbar=False, source_indices=None, progress_callback=None):
     """Demix a tensor track with the full MLX inference path.
 
@@ -955,7 +1051,6 @@ def demix_track_mlx_full(config, model, mix, device, pbar=False, source_indices=
             model,
             mx.stack([chunk for (chunk, _), _ in batch], axis=0),
             C,
-            clear_cache_after_eval=bool(config.inference.get("mps_mlx_clear_cache", False)),
         )
         chunks = _mlx_select_sources(chunks, source_indices)
         for j, ((_, length), idx) in enumerate(batch):

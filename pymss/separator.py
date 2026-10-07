@@ -37,7 +37,6 @@ INFERENCE_PARAM_TARGETS = {
     "cuda_attention_backend": "inference",
     "mps_attention_backend": "inference",
     "mps_mlx_min_tokens": "inference",
-    "mps_mlx_clear_cache": "inference",
     "mps_model_backend": "inference",
     "mps_model_compute_dtype": "inference",
     "fuse_conv_bn": "inference",
@@ -58,7 +57,6 @@ PASSTHROUGH_INFERENCE_PARAMS = frozenset(
         "use_amp",
         "cuda_attention_backend",
         "mps_attention_backend",
-        "mps_mlx_clear_cache",
         "mps_model_backend",
         "mps_model_compute_dtype",
         "fuse_conv_bn",
@@ -95,7 +93,6 @@ def _resolve_public_device(device, inference_params, logger):
             raise RuntimeError("device='mlx' requires Apple Silicon MPS support")
         inference_params.setdefault("mps_model_backend", "mlx_full")
         inference_params.setdefault("mps_model_compute_dtype", "float16")
-        inference_params.setdefault("mps_mlx_clear_cache", True)
         logger.debug("Mapping device='mlx' to device='mps' with MLX full model backend")
         return "mps", inference_params
     if requested_device == "rocm":
@@ -150,10 +147,7 @@ def _prefer_mlx_for_auto(requested_device, selected_device, inference_params, lo
         if "mps_model_backend" not in inference_params:
             inference_params["mps_model_backend"] = "mlx_full"
             inference_params.setdefault("mps_model_compute_dtype", "float16")
-            inference_params.setdefault("mps_mlx_clear_cache", True)
             logger.debug("Auto device selected MPS, enabling MLX full model backend")
-        elif inference_params.get("mps_model_backend") == "mlx_full":
-            inference_params.setdefault("mps_mlx_clear_cache", True)
     return inference_params
 
 
@@ -1132,9 +1126,32 @@ class MSSeparator:
             model = torch.nn.DataParallel(model, device_ids=self.device_ids)
         model = model.to("cpu" if keep_torch_model_cpu else self.device)
         model.eval()
+        self._warmup_mlx_full_backend(model, config)
 
         self.logger.debug(f"Loading model completed, duration: {time() - start_time:.2f} seconds")
         return model, config
+
+    def _warmup_mlx_full_backend(self, model, config):
+        # pre-build the MLX full backend so the first batch is not the peak; failures downgrade to torch
+        if torch.device(self.device).type != "mps":
+            return
+        if getattr(model, "mps_model_backend", "") != "mlx_full":
+            return
+        from .utils import warmup_mlx_full
+
+        warmup_start = time()
+        if warmup_mlx_full(model, config):
+            self.logger.debug(f"MLX full warmup completed, duration: {time() - warmup_start:.2f} seconds")
+            return
+        self.logger.warning(
+            f"MLX full warmup failed for {type(model).__name__} "
+            f"({getattr(model, '_pymss_mlx_full_backend_error', 'unknown error')}); using 'torch'"
+        )
+        model.mps_model_backend = "torch"
+        params = getattr(model, "parameters", None)
+        first = next(params(), None) if callable(params) else None
+        if first is not None and first.device.type != torch.device(self.device).type:
+            model.to(self.device)  # MLX full loads weights on CPU; move them back for the torch path
 
     def _log_model_config(self, model_type, config, config_path=None, include_config_path=True):
         """Log resolved separator, audio, and model inference settings.
