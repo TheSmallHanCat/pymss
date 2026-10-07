@@ -68,6 +68,68 @@ def test_failed_load_does_not_retain_the_previous_model():
         assert cache.get(model_name="b") is not first
 
 
+def test_failed_eviction_aborts_loading_and_retains_the_separator_for_cleanup():
+    failure = RuntimeError("Model cleanup failed")
+    first = SimpleNamespace(close=Mock(side_effect=[failure, None]))
+    factory = Mock(return_value=first)
+    with SeparatorCache(factory=factory) as cache:
+        cache.get(model_name="a")
+        with pytest.raises(RuntimeError) as caught:
+            cache.get(model_name="b")
+        assert caught.value is failure
+        factory.assert_called_once()
+        first.close.assert_called_once()
+    assert first.close.call_count == 2
+
+
+def test_eviction_can_retry_after_a_failed_close():
+    first = SimpleNamespace(close=Mock(side_effect=[RuntimeError("Model cleanup failed"), None]))
+    second = SimpleNamespace(close=Mock())
+    factory = Mock(side_effect=[first, second])
+    with SeparatorCache(factory=factory) as cache:
+        cache.get(model_name="a")
+        with pytest.raises(RuntimeError, match="Model cleanup failed"):
+            cache.get(model_name="b")
+        assert cache.get(model_name="b") is second
+        assert first.close.call_count == 2
+        assert factory.call_count == 2
+    second.close.assert_called_once()
+
+
+def test_failed_close_does_not_reuse_a_partially_closed_separator():
+    first = SimpleNamespace(closed=False)
+    second = SimpleNamespace(close=Mock())
+
+    def close():
+        first.closed = True
+        if first.close.call_count == 1:
+            raise RuntimeError("Model cleanup failed")
+
+    first.close = Mock(side_effect=close)
+    factory = Mock(side_effect=[first, second])
+    with SeparatorCache(factory=factory) as cache:
+        assert cache.get(model_name="a") is first
+        with pytest.raises(RuntimeError, match="Model cleanup failed"):
+            cache.get(model_name="b")
+        assert first.closed
+        assert cache.get(model_name="a") is second
+        assert first.close.call_count == 2
+    second.close.assert_called_once()
+
+
+def test_final_cache_close_continues_after_a_separator_error():
+    first = SimpleNamespace(close=Mock(side_effect=RuntimeError("Model cleanup failed")))
+    second = SimpleNamespace(close=Mock())
+    factory = Mock(side_effect=[first, second])
+    cache = SeparatorCache(factory=factory, max_entries=None)
+    cache.get(model_name="a")
+    cache.get(model_name="b")
+    cache.close()
+    cache.close()
+    first.close.assert_called_once()
+    second.close.assert_called_once()
+
+
 def make_dag(node_type, audios, received):
     register_node("lifecycle_source", signature=lambda node: NodeSignature([], ["audio"], [AUDIO]),
                   execute=lambda ctx, inputs: NodeResult(outputs={0: audios}))

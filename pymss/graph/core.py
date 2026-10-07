@@ -349,6 +349,7 @@ class SeparatorCache:
         if max_entries is not None and (isinstance(max_entries, bool) or not isinstance(max_entries, int) or max_entries < 1):
             raise ValueError("max_entries must be a positive integer or None")
         self._entries: dict[str, Any] = {}
+        self._pending_close: Any = None
         self._factory = factory or self._default_factory
         self.max_entries = max_entries
 
@@ -373,13 +374,18 @@ class SeparatorCache:
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
     def get(self, **kwargs: Any) -> Any:
+        if self._pending_close is not None:
+            self._close_separator(self._pending_close)
+            self._pending_close = None
         key = self.key_for(**kwargs)
         if key in self._entries:
             entry = self._entries.pop(key)
         else:
             while self.max_entries is not None and len(self._entries) >= self.max_entries:
                 oldest = next(iter(self._entries))
-                self._close_separator(self._entries.pop(oldest))
+                self._pending_close = self._entries.pop(oldest)
+                self._close_separator(self._pending_close)
+                self._pending_close = None
             entry = self._factory(**kwargs)
         self._entries[key] = entry
         return entry
@@ -388,15 +394,19 @@ class SeparatorCache:
     def _close_separator(separator: Any) -> None:
         close = getattr(separator, "close", None)
         if callable(close):
-            try:
-                close()
-            except Exception:  # pragma: no cover - best-effort cleanup
-                pass
+            close()
 
     def close(self) -> None:
-        entries, self._entries = self._entries, {}
-        for separator in entries.values():
-            self._close_separator(separator)
+        entries = list(self._entries.values())
+        self._entries = {}
+        if self._pending_close is not None:
+            entries.append(self._pending_close)
+            self._pending_close = None
+        for separator in entries:
+            try:
+                self._close_separator(separator)
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
 
     def __enter__(self) -> "SeparatorCache":
         return self
