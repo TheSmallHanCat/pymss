@@ -3,6 +3,8 @@ from unittest.mock import patch
 
 import numpy as np
 import pytest
+import torch
+import yaml
 
 from pymss.config import AttrDict
 from pymss.model_registry import create_separator, get_model_entry, resolve_model
@@ -10,7 +12,6 @@ from pymss.separator import (
     MSSeparator,
     _apply_target_instrument_override,
     _build_results,
-    _catalog_target_instrument_override,
 )
 
 
@@ -54,11 +55,6 @@ def test_target_instrument_override_rejects_unknown_stems():
 
     with pytest.raises(ValueError, match="is not present in configured instruments"):
         _apply_target_instrument_override(config, "Other")
-
-
-def test_explicit_catalog_model_paths_pick_up_the_override():
-    assert _catalog_target_instrument_override(f"models/{MODEL_NAME}") == "Vocals"
-    assert _catalog_target_instrument_override("models/custom.ckpt") is None
 
 
 def test_corrected_target_labels_the_prediction_as_vocals_and_residual_as_instrumental():
@@ -122,3 +118,83 @@ def test_from_model_name_forwards_catalog_target_override():
         MSSeparator.from_model_name(MODEL_NAME)
 
     assert initialize.call_args.kwargs["target_instrument_override"] == "Vocals"
+
+
+@pytest.fixture
+def model_files(tmp_path, monkeypatch):
+    from pymss.config import load_config
+
+    weights = tmp_path / MODEL_NAME
+    weights.touch()
+    config_path = tmp_path / "custom.yaml"
+    config_path.write_text(yaml.safe_dump({
+        "audio": {"chunk_size": 1024, "sample_rate": 44100},
+        "model": {},
+        "inference": {"batch_size": 1, "num_overlap": 1},
+        "training": {"instruments": ["Drums", "Bass"], "target_instrument": "Drums"},
+    }), encoding="utf-8")
+    monkeypatch.setattr("pymss.separator._load_state_dict", lambda *_args: {})
+    monkeypatch.setattr("pymss.separator.get_model_from_config", lambda _type, path, **_kwargs: (
+        torch.nn.Identity(), load_config(path),
+    ))
+    monkeypatch.setattr(MSSeparator, "log_system_info", lambda _self: None)
+    monkeypatch.setattr(MSSeparator, "check_ffmpeg_installed", lambda _self: None)
+    return weights, config_path
+
+
+def test_explicit_files_preserve_target_despite_catalog_filename(model_files):
+    weights, config_path = model_files
+    with MSSeparator("bs_roformer", weights, config_path, device="cpu") as separator:
+        assert separator.target_instrument_override is None
+        assert separator.config.training.target_instrument == "Drums"
+
+
+def test_explicit_target_override_still_applies_to_direct_files(model_files):
+    weights, config_path = model_files
+    with MSSeparator("bs_roformer", weights, config_path, device="cpu", target_instrument_override="bass") as separator:
+        assert separator.config.training.target_instrument == "Bass"
+
+
+@pytest.mark.parametrize("factory", [create_separator, MSSeparator.from_model_name])
+@pytest.mark.parametrize("override_kwargs", [{}, {"target_instrument_override": None}], ids=["omitted", "none"])
+def test_registered_model_filename_does_not_apply_catalog_override(
+    model_files, tmp_path, monkeypatch, factory, override_kwargs
+):
+    from pymss import user_models
+
+    weights, config_path = model_files
+    registry = tmp_path / "user_models.json"
+    monkeypatch.setattr(user_models, "DEFAULT_USER_MODELS_PATH", registry)
+    user_models.register_user_model("custom-model", "bs_roformer", weights, config_path, path=registry)
+    assert resolve_model("custom-model")["source"] == "user"
+
+    with factory("custom-model", device="cpu", **override_kwargs) as separator:
+        assert separator.target_instrument_override is None
+        assert separator.config.training.target_instrument == "Drums"
+
+
+@pytest.mark.parametrize("factory", [create_separator, MSSeparator.from_model_name])
+@pytest.mark.parametrize("override_kwargs,expected_override,expected_target", [
+    ({}, "Vocals", "Vocals"),
+    ({"target_instrument_override": None}, "Vocals", "Vocals"),
+    ({"target_instrument_override": "instrumental"}, "instrumental", "Instrumental"),
+    ({"target_instrument_override": ""}, "", "Instrumental"),
+], ids=["omitted", "none", "explicit", "disabled"])
+def test_catalog_name_applies_override_during_model_loading(
+    model_files, tmp_path, factory, override_kwargs, expected_override, expected_target
+):
+    from pymss.model_registry import config_path_for, model_path_for
+
+    _, original_config = model_files
+    entry = get_model_entry(MODEL_NAME)
+    weights = model_path_for(entry, tmp_path)
+    config_path = config_path_for(entry, tmp_path)
+    weights.parent.mkdir(parents=True, exist_ok=True)
+    weights.touch()
+    config = yaml.safe_load(original_config.read_text(encoding="utf-8"))
+    config["training"] = {"instruments": ["Vocals", "Instrumental"], "target_instrument": "Instrumental"}
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    with factory(MODEL_NAME, model_dir=tmp_path, device="cpu", **override_kwargs) as separator:
+        assert separator.target_instrument_override == expected_override
+        assert separator.config.training.target_instrument == expected_target

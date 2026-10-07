@@ -477,8 +477,8 @@ def create_separator(model_name, model_dir=None, **separator_kwargs):
         resolved,
         separator_kwargs.pop("inference_params", None),
     )
-    if resolved.get("target_instrument_override"):
-        separator_kwargs.setdefault("target_instrument_override", resolved["target_instrument_override"])
+    if resolved.get("target_instrument_override") and separator_kwargs.get("target_instrument_override") is None:
+        separator_kwargs["target_instrument_override"] = resolved["target_instrument_override"]
     return MSSeparator(
         model_type=resolved["model_type"],
         model_path=resolved["model_path"],

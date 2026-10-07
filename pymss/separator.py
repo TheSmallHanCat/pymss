@@ -622,17 +622,6 @@ def _apply_target_instrument_override(config, override, logger=None):
     return config
 
 
-def _catalog_target_instrument_override(model_path):
-    """Return a known metadata correction for a catalog model path."""
-    try:
-        from .model_registry import get_model_entry
-
-        entry = get_model_entry(os.path.basename(os.fspath(model_path)))
-    except (KeyError, OSError, TypeError, ValueError):
-        return None
-    return getattr(entry, "target_instrument_override", "") or None
-
-
 def _get_store_dir(store_dirs, instr):
     """Return store dir.
 
@@ -753,8 +742,9 @@ class MSSeparator:
             ``aggression`` and ``window_size``.
         target_instrument_override (str | None, optional): Corrects an
             inaccurate ``training.target_instrument`` value in a model YAML.
-            Catalog models apply known corrections automatically. Defaults to
-            None.
+            Catalog name loaders apply known corrections automatically. Explicit
+            model files keep the YAML target unless an override is supplied.
+            Defaults to None.
 
     Example:
         >>> separator = MSSeparator.from_model_name(
@@ -859,7 +849,8 @@ class MSSeparator:
                 output peak normalization.
             target_instrument_override (str | None, optional): Corrects an
                 inaccurate target stem declaration while retaining the YAML's
-                configured instrument names. Defaults to None.
+                configured instrument names. Defaults to None, preserving the
+                target declared in explicit model files.
 
         Returns:
             None: The separator is loaded and ready for inference.
@@ -903,11 +894,7 @@ class MSSeparator:
         self.progress_callback = progress_callback
         self.inference_params = inference_params
         self.output_normalize = self.inference_params.get("normalize", False)
-        self.target_instrument_override = (
-            target_instrument_override
-            if target_instrument_override is not None
-            else _catalog_target_instrument_override(model_path)
-        )
+        self.target_instrument_override = target_instrument_override
 
         if self.debug:
             set_log_level(self.logger, logging.DEBUG)
@@ -1031,8 +1018,8 @@ class MSSeparator:
             resolved,
             kwargs.pop("inference_params", None),
         )
-        if resolved.get("target_instrument_override"):
-            kwargs.setdefault("target_instrument_override", resolved["target_instrument_override"])
+        if resolved.get("target_instrument_override") and kwargs.get("target_instrument_override") is None:
+            kwargs["target_instrument_override"] = resolved["target_instrument_override"]
         return cls(
             model_type=resolved["model_type"],
             model_path=resolved["model_path"],
