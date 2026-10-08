@@ -17,7 +17,7 @@ from .audio_io import downmix_to_stereo, load_audio, save_audio
 from .utils import _resolve_use_amp, clear_mlx_cache, demix, get_model_from_config
 from .logger import get_separation_logger, set_log_level
 from .config import AttrDict, load_config
-from pymss_core import ModelTypeDetectionError, detect_model_type
+from pymss_core import ModelTypeDetectionError, clear_model_runtime_caches, detect_model_type
 
 
 INFERENCE_PARAM_TARGETS = {
@@ -115,8 +115,19 @@ def _select_device(device, device_ids, logger):
 
     Returns:
         Any: Computed result."""
-    if device not in ["cpu", "cuda", "mps"]:
-        if torch.cuda.is_available():
+    if device not in ["cpu", "mps"]:
+        cuda_available = torch.cuda.is_available()
+        if device == "cuda" and not cuda_available:
+            raise RuntimeError("device='cuda' requires a CUDA or ROCm-enabled PyTorch build with an available GPU")
+        if cuda_available:
+            if not isinstance(device_ids, (list, tuple)) or not device_ids or any(
+                isinstance(index, bool) or not isinstance(index, int) or index < 0 for index in device_ids
+            ):
+                raise ValueError("CUDA device_ids must be a non-empty list of non-negative integers")
+            device_count = torch.cuda.device_count()
+            invalid_ids = [index for index in device_ids if index >= device_count]
+            if invalid_ids:
+                raise ValueError(f"CUDA device ID(s) {invalid_ids} are outside the available range [0, {device_count})")
             if getattr(torch.version, "hip", None):
                 logger.debug("ROCm/HIP device is available in Torch, setting Torch device to CUDA device (backed by ROCm)")
             else:
@@ -589,6 +600,28 @@ def _resolve_instruments(config, stems=None):
     return selected, source_indices
 
 
+def _apply_target_instrument_override(config, override, logger=None):
+    """Correct inaccurate target metadata without modifying the downloaded YAML."""
+    if override is None or not str(override).strip():
+        return config
+    requested = str(override).strip()
+    instruments = list(config.training.instruments)
+    match = next((item for item in instruments if str(item).casefold() == requested.casefold()), None)
+    if match is None:
+        raise ValueError(
+            f"target_instrument_override {requested!r} is not present in configured instruments: {instruments}"
+        )
+    previous = config.training.target_instrument
+    config.training.target_instrument = match
+    if logger is not None and previous != match:
+        logger.info(
+            "Correcting model target instrument metadata from %r to %r.",
+            previous,
+            match,
+        )
+    return config
+
+
 def _get_store_dir(store_dirs, instr):
     """Return store dir.
 
@@ -707,6 +740,11 @@ class MSSeparator:
             ``stem_batch_size``, ``standardize``, ``normalize``, ``mask_mode``,
             attention backend options, and VR-specific options such as
             ``aggression`` and ``window_size``.
+        target_instrument_override (str | None, optional): Corrects an
+            inaccurate ``training.target_instrument`` value in a model YAML.
+            Catalog name loaders apply known corrections automatically. Explicit
+            model files keep the YAML target unless an override is supplied.
+            Defaults to None.
 
     Example:
         >>> separator = MSSeparator.from_model_name(
@@ -762,6 +800,7 @@ class MSSeparator:
             "normalize": False,
             "mask_mode": None,
         },
+        target_instrument_override=None,
     ):
         """Initialize and load a separator from explicit model files.
 
@@ -808,6 +847,10 @@ class MSSeparator:
                 values keep model config defaults. ``standardize`` controls
                 legacy input standardization, and ``normalize`` controls linked
                 output peak normalization.
+            target_instrument_override (str | None, optional): Corrects an
+                inaccurate target stem declaration while retaining the YAML's
+                configured instrument names. Defaults to None, preserving the
+                target declared in explicit model files.
 
         Returns:
             None: The separator is loaded and ready for inference.
@@ -851,6 +894,7 @@ class MSSeparator:
         self.progress_callback = progress_callback
         self.inference_params = inference_params
         self.output_normalize = self.inference_params.get("normalize", False)
+        self.target_instrument_override = target_instrument_override
 
         if self.debug:
             set_log_level(self.logger, logging.DEBUG)
@@ -974,6 +1018,8 @@ class MSSeparator:
             resolved,
             kwargs.pop("inference_params", None),
         )
+        if resolved.get("target_instrument_override") and kwargs.get("target_instrument_override") is None:
+            kwargs["target_instrument_override"] = resolved["target_instrument_override"]
         return cls(
             model_type=resolved["model_type"],
             model_path=resolved["model_path"],
@@ -1062,6 +1108,7 @@ class MSSeparator:
                     },
                 }
             )
+            _apply_target_instrument_override(config, self.target_instrument_override, self.logger)
             self.update_inference_params(config, self.inference_params)
             common_config = {
                 "logger": self.logger,
@@ -1087,6 +1134,7 @@ class MSSeparator:
             config_path = self.config_path if self.config_path_given else None
             model, config = load_legacy_demucs_model(self.model_path, config_path)
             config = AttrDict(config)
+            _apply_target_instrument_override(config, self.target_instrument_override, self.logger)
             self.update_inference_params(config, self.inference_params)
             model = model.to(self.device)
             model.eval()
@@ -1107,6 +1155,7 @@ class MSSeparator:
         with init_context:
             model, config = get_model_from_config(model_type, self.config_path, model_kwargs_override=model_kwargs_override)
 
+        _apply_target_instrument_override(config, self.target_instrument_override, self.logger)
         self.update_inference_params(config, self.inference_params)
         self.apply_model_inference_config(model, config)
 
@@ -1122,7 +1171,7 @@ class MSSeparator:
             _coerce_cpu_low_precision(model)
 
         keep_torch_model_cpu = _store_torch_model_on_cpu_for_mlx(model, self.device)
-        if len(self.device_ids) > 1 and not keep_torch_model_cpu:
+        if len(self.device_ids) > 1 and torch.device(self.device).type == "cuda" and not keep_torch_model_cpu:
             model = torch.nn.DataParallel(model, device_ids=self.device_ids)
         model = model.to("cpu" if keep_torch_model_cpu else self.device)
         model.eval()
@@ -1619,6 +1668,8 @@ class MSSeparator:
             is_stereo = model_channels == 2 or (model_channels is None and input_channels > 1)
             mixes = [_prepare_mix_channels(mix, is_stereo, self.logger, sample_rate, channel_layout)]
         if self.model_type == "vr":
+            # Graph callers assign the callback after the VR child is loaded.
+            self.model.progress_callback = self.progress_callback
             results = self.model.separate_array(mixes[0], sample_rate)
             if input_channels == 1:
                 results = {stem: audio.mean(axis=1, keepdims=True) if audio.ndim == 2 else audio
@@ -1705,20 +1756,25 @@ class MSSeparator:
         self.logger.debug("Closing separator and releasing model references...")
         model = getattr(self, "model", None)
         try:
-            if self.model_type == "vr" and model is not None:
-                model_run = getattr(model, "model_run", None)
-                if model_run is not None and hasattr(model_run, "to"):
+            cache_model = getattr(model, "model_run", None) if self.model_type == "vr" else model
+            try:
+                if isinstance(cache_model, torch.nn.Module):
+                    clear_model_runtime_caches(cache_model)
+            finally:
+                if self.model_type == "vr" and model is not None:
+                    model_run = getattr(model, "model_run", None)
+                    if model_run is not None and hasattr(model_run, "to"):
+                        try:
+                            model_run.to("cpu")
+                        except Exception as exc:
+                            self.logger.debug(f"Could not move VR model to CPU during close: {exc}")
+                    if hasattr(model, "model_run"):
+                        model.model_run = None
+                elif model is not None and hasattr(model, "to"):
                     try:
-                        model_run.to("cpu")
+                        model.to("cpu")
                     except Exception as exc:
-                        self.logger.debug(f"Could not move VR model to CPU during close: {exc}")
-                if hasattr(model, "model_run"):
-                    model.model_run = None
-            elif model is not None and hasattr(model, "to"):
-                try:
-                    model.to("cpu")
-                except Exception as exc:
-                    self.logger.debug(f"Could not move model to CPU during close: {exc}")
+                        self.logger.debug(f"Could not move model to CPU during close: {exc}")
         finally:
             self._restore_cudnn_benchmark()
             self.model = None
