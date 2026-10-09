@@ -265,7 +265,7 @@ def _audio_waveform(audio: Any) -> tuple[np.ndarray, int]:
     return np.asarray(arr, dtype=np.float32), int(sr)
 
 
-# Reuse the resample helper from nodes (avoids duplicating the librosa-backed
+# Reuse the resample helper from nodes (avoids duplicating the PyAV-backed
 # implementation). AudioMerge needs it to align inputs at different sample rates.
 from .nodes import _resample
 

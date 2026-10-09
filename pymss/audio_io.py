@@ -64,6 +64,67 @@ def _frame_to_audio(frame, mono):
     return (audio.mean(axis=0, keepdims=True) if mono and audio.shape[0] > 1 else audio).astype(np.float32, copy=False)
 
 
+def resample_audio(audio, orig_sr, target_sr):
+    """Resample mono or channel-first audio with the file loader's FFmpeg filter.
+
+    Return float32 samples with the input array's rank. Same-rate and empty
+    inputs pass through; frame-sized copies bound temporary memory, and the
+    final flush preserves samples buffered by the resampler. Independent
+    channel groups stay within FFmpeg's 64-channel resampling limit.
+    """
+    audio = np.asarray(audio, dtype=np.float32)
+    source_rate, target_rate = int(orig_sr), int(target_sr)
+    if source_rate <= 0 or target_rate <= 0:
+        raise ValueError("Sample rates must be positive.")
+    if audio.ndim not in (1, 2) or (audio.ndim == 2 and audio.shape[0] == 0):
+        raise ValueError("Expected mono or channel-first audio with at least one channel.")
+    if source_rate == target_rate or audio.shape[-1] == 0:
+        return audio
+
+    mono = audio.ndim == 1
+    samples = audio.reshape(1, -1) if mono else audio
+    channels, frames = samples.shape
+    capacity = (frames * target_rate + source_rate - 1) // source_rate
+    result = np.empty((channels, capacity), dtype=np.float32)
+    output_frames = None
+
+    for channel_start in range(0, channels, 64):
+        channel_stop = min(channel_start + 64, channels)
+        group_channels = channel_stop - channel_start
+        layout = av.AudioLayout(f"{group_channels} channels")
+        # PyAV 14 cannot safely convert planar frames with eight or more channels.
+        packed_frames = group_channels >= 8
+        frame_format = "flt" if packed_frames else "fltp"
+        resampler = av.AudioResampler(format=frame_format, layout=layout, rate=target_rate)
+        written = 0
+
+        def append_outputs(outputs):
+            nonlocal written
+            for output in outputs:
+                block = _frame_to_audio(output, mono=False)
+                end = written + block.shape[-1]
+                result[channel_start:channel_stop, written:end] = block
+                written = end
+
+        for start in range(0, frames, 65536):
+            block = samples[channel_start:channel_stop, start:start + 65536]
+            if packed_frames:
+                block = np.ascontiguousarray(block.T).reshape(1, -1)
+            else:
+                block = np.ascontiguousarray(block)
+            frame = av.AudioFrame.from_ndarray(block, format=frame_format, layout=layout.name)
+            frame.sample_rate = source_rate
+            append_outputs(resampler.resample(frame))
+        append_outputs(resampler.resample(None))
+        if output_frames is None:
+            output_frames = written
+        elif written != output_frames:
+            raise RuntimeError("Resampled channel groups produced different sample counts.")
+
+    result = np.ascontiguousarray(result[:, :output_frames])
+    return result[0] if mono else result
+
+
 def _ffmpeg_audio_stream_info(path):
     """Return basic audio stream information from ffprobe."""
     command = [
