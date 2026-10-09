@@ -641,11 +641,9 @@ def _to_save_audio(audio: Any) -> np.ndarray:
 def _ensure_sample_rate(audio: np.ndarray, current_sr: int, target_sr: int) -> np.ndarray:
     if int(current_sr) == int(target_sr):
         return audio
-    import librosa
+    from .audio_io import resample_audio
 
-    return np.ascontiguousarray(
-        librosa.resample(np.asarray(audio, dtype=np.float32), orig_sr=int(current_sr), target_sr=int(target_sr), axis=-1)
-    )
+    return np.ascontiguousarray(resample_audio(audio, current_sr, target_sr))
 
 
 def _input_files(input_path: str | os.PathLike) -> list[str]:

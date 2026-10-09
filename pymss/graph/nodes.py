@@ -212,8 +212,7 @@ def _has_config(separator: Any) -> bool:
 def _resample(audio: np.ndarray, source_sr: int, target_sr: int) -> np.ndarray:
     if source_sr == target_sr or audio.size == 0:
         return audio
-    # Use the built-in resample capability (librosa-based), not torchaudio.
-    # pymss has no torchaudio dependency.
+    # Share the file loader's PyAV/FFmpeg resampling through the built-in capability.
     from ..plugins.builtins import resample
 
     return resample(audio, source_sr, target_sr)
