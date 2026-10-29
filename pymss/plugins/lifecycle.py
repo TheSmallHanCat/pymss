@@ -13,10 +13,11 @@ import importlib.util
 from importlib.machinery import ModuleSpec
 import re
 import sys
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from uuid import uuid4
 
 from .manifest import ManifestError, PluginManifest, parse_entry_point, read_manifest
@@ -254,13 +255,19 @@ class PluginManager:
             visit(state, ())
         return ordered
 
-    def activate(self, registration_factory) -> list[dict[str, Any]]:
+    def activate(
+        self, registration_factory,
+        *, activation_context: Callable[[Path], AbstractContextManager[None]] | None = None,
+    ) -> list[dict[str, Any]]:
         """Activate resolved plugins in dependency order.
 
         ``registration_factory(source)`` returns the registration handle passed
         to the plugin's ``setup()``. A plugin whose setup fails is rolled back
         (registrations removed by the caller-provided ``rollback`` on the
         handle) and recorded as failed; dependents become blocked.
+        The optional host context runs only for resolved plugins and surrounds
+        their import and registration. It must propagate errors after cleanup;
+        activation is committed only after the context exits successfully.
         """
         report: list[dict[str, Any]] = []
         ordered = self.activation_order()
@@ -273,19 +280,21 @@ class PluginManager:
             handle = None
             namespace = None
             try:
-                handle = registration_factory(f"plugin:{manifest.plugin_id}")
-                module, namespace = _import_manifest_entry(state.directory, module_name)
-                setup = getattr(module, attr, None)
-                if setup is None:
-                    raise AttributeError(f"entry {module_name}:{attr} has no {attr!r}")
-                setup(handle)
-                registered = set(getattr(handle, "registered_operations", ()))
-                if registered != manifest.operation_ids:
-                    raise ManifestError(
-                        "setup() operations do not match the manifest "
-                        f"(missing {sorted(manifest.operation_ids - registered)}, "
-                        f"undeclared {sorted(registered - manifest.operation_ids)})"
-                    )
+                context = activation_context(state.directory) if activation_context is not None else nullcontext()
+                with context:
+                    handle = registration_factory(f"plugin:{manifest.plugin_id}")
+                    module, namespace = _import_manifest_entry(state.directory, module_name)
+                    setup = getattr(module, attr, None)
+                    if setup is None:
+                        raise AttributeError(f"entry {module_name}:{attr} has no {attr!r}")
+                    setup(handle)
+                    registered = set(getattr(handle, "registered_operations", ()))
+                    if registered != manifest.operation_ids:
+                        raise ManifestError(
+                            "setup() operations do not match the manifest "
+                            f"(missing {sorted(manifest.operation_ids - registered)}, "
+                            f"undeclared {sorted(registered - manifest.operation_ids)})"
+                        )
                 state.status = "activated"
                 state.contributions = manifest.to_dict()["contributions"]
                 self._activated.append(manifest.plugin_id)

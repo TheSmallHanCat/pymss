@@ -18,6 +18,7 @@ Design (round 2 of the plugin redesign, docs/plugin-redesign-plan.md):
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
@@ -256,6 +257,7 @@ class Runtime:
     def load_plugins(
         self, roots: Sequence[str | Path] | None = None,
         *, validate_plugin: Callable[[Path], None] | None = None,
+        activation_context: Callable[[Path], AbstractContextManager[None]] | None = None,
     ) -> list[dict[str, Any]]:
         """Load v2 manifest plugins from ``roots``; each setup() registers into *this* runtime.
 
@@ -269,6 +271,9 @@ class Runtime:
         A host may validate each newly discovered package before resolution;
         a validation error blocks the package and its dependent plugins before
         any of their Python code is imported.
+        ``activation_context`` surrounds import, setup and registration checks
+        only after resolution succeeds. It must propagate activation errors so
+        failed registrations are rolled back and dependents remain blocked.
         """
         from ..plugins.lifecycle import PluginManager, pymss_package_version
         from ..plugins.loader import get_plugins_dir
@@ -284,7 +289,10 @@ class Runtime:
                     except Exception as error:
                         state.status, state.error = "blocked", str(error)
         manager.resolve(pymss_version=pymss_package_version())
-        self._load_report = manager.activate(lambda source: _RuntimePluginHandle(self, source=source))
+        self._load_report = manager.activate(
+            lambda source: _RuntimePluginHandle(self, source=source),
+            activation_context=activation_context,
+        )
         for state in states:
             if state.status == "activated" and state.manifest is not None:
                 self._active_plugins[state.manifest.plugin_id] = state

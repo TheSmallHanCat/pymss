@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
@@ -68,11 +69,12 @@ def get_last_report() -> PluginLoadReport | None:
 def bootstrap(
     force: bool = False, roots: Sequence[Path] | None = None,
     *, validate_plugin: Callable[[Path], None] | None = None,
+    activation_context: Callable[[Path], AbstractContextManager[None]] | None = None,
 ) -> PluginLoadReport:
     """Discover and load all plugins into the default runtime.
 
     Idempotent: subsequent calls return the cached report unless ``force=True``.
-    Host validation must be supplied on the first load, before activation.
+    Host validation and activation context must be supplied on the first load.
     """
     global _LAST_REPORT
     if _LAST_REPORT is not None and _LAST_REPORT.bootstrapped and not force:
@@ -81,7 +83,9 @@ def bootstrap(
     from ..operations import default_runtime
 
     report = PluginLoadReport(bootstrapped=True)
-    for row in default_runtime().load_plugins(roots, validate_plugin=validate_plugin):
+    for row in default_runtime().load_plugins(
+        roots, validate_plugin=validate_plugin, activation_context=activation_context,
+    ):
         path = str(row.get("path") or "")
         report.results.append(PluginLoadResult(
             name=str(row.get("name") or ""),
@@ -95,7 +99,10 @@ def bootstrap(
     return report
 
 
-def ensure_plugins_loaded(*, validate_plugin: Callable[[Path], None] | None = None) -> PluginLoadReport:
+def ensure_plugins_loaded(
+    *, validate_plugin: Callable[[Path], None] | None = None,
+    activation_context: Callable[[Path], AbstractContextManager[None]] | None = None,
+) -> PluginLoadReport:
     """Load user plugins once per process before an entry point uses them.
 
     Business entry points (infer / workflow / comfy run / serve / ops) call
@@ -104,7 +111,7 @@ def ensure_plugins_loaded(*, validate_plugin: Callable[[Path], None] | None = No
     "produce a report for the plugins command". Failures are already isolated
     per plugin; the report is retrievable via ``get_last_report()``.
     """
-    return bootstrap(validate_plugin=validate_plugin)
+    return bootstrap(validate_plugin=validate_plugin, activation_context=activation_context)
 
 
 def reset() -> None:
