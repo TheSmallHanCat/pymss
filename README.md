@@ -214,15 +214,16 @@ See [server CLI docs](./docs/server/cli.md), [server API docs](./docs/server/api
 
 pymss has a plugin system for extending capabilities — audio DSP operations, audio codecs, and workflow nodes. Built-in functionality (23 capabilities: 15 DSP/channel ops + 8 codecs) is registered through the same mechanism plugins use, so core and extensions share one pool.
 
-**Install a plugin** — by official registry name, git URL, or local path. Append `#subdir` to install from a monorepo subdirectory; pin a version with `@tag`:
+**Install a plugin** — use pymss 2.2 or later and specify a full plugin id from the official registry, a repository URL, or a local path. Append `#subdir` to install from a monorepo subdirectory:
 
 ```sh
-pymss install loudnorm                                   # by official registry name
-pymss install "https://github.com/xxx/repo#plugins/eq"   # URL + subdirectory
-pymss install https://github.com/xxx/repo --subpath plugins/eq
+pymss install pymss.loudnorm                             # full plugin id
+pymss install "https://github.com/pymss-project/pymss-plugins#plugins/loudnorm"
+pymss install https://github.com/pymss-project/pymss-plugins --subpath plugins/loudnorm
 pymss install ./my-local-plugin
-pymss install loudnorm@v0.2.0                            # pin a git tag/branch/commit
 ```
+
+To select a source revision, use `pymss.loudnorm@<tag-or-commit>`, replacing the placeholder with an existing tag or full commit SHA from the source repository. A plugin's package version does not imply that a matching Git tag exists.
 
 Plugin dependencies (declared in its `pyproject.toml`) are **installed automatically** into the current environment — uv is used when the venv is uv-managed, pip otherwise. Pass `--no-deps` to skip.
 
@@ -232,29 +233,69 @@ Plugin dependencies (declared in its `pyproject.toml`) are **installed automatic
 pymss plugins list           # installed plugins: version, source, load status
 pymss plugins available      # browse the official registry
 pymss plugins search loudness   # search the registry by name/description/tag
-pymss plugins update loudnorm   # reinstall a plugin at its latest version
-pymss uninstall loudnorm
+pymss plugins update pymss.loudnorm   # update from the recorded source
+pymss uninstall pymss.loudnorm
 pymss plugins dir            # print the plugins directory
 ```
 
-`update` works identically for **official and third-party (URL/path-installed) plugins** — pymss records each install's provenance, so you only ever refer to a plugin by its folder name.
+`update` works identically for **official and third-party (URL/path-installed) plugins** — pymss records each install's provenance. Update and uninstall commands use the manifest's plugin id, which is also the installed directory name.
 
 Plugins live in `~/.pymss/plugins/` (override with `PYMSS_PLUGINS_DIR`) and need a v2 manifest (see `docs/plugin-protocol.md`). A single plugin failing to load never blocks others. The official plugin registry is a separate `pymss-plugins` repo (a `registry.json` keyed by plugin id) — point `pymss install <id>` at a custom one via `PYMSS_PLUGINS_REGISTRY`.
 
-**Write a plugin** — a standard `pyproject.toml` with `[project].name`/`version`/`dependencies` is all pymss needs (no pymss-specific fields). Register a capability and pymss makes it available to the Python API, the CLI, and workflow nodes:
+**Write a plugin** — create `pyproject.toml` and `__init__.py` in `my-local-plugin/`. The v2 manifest declares the plugin identity and every Operation registered by `setup(plugin)`.
+
+`pyproject.toml`:
+
+```toml
+[project]
+name = "pymss-plugin-gain"
+version = "0.1.0"
+
+[tool.pymss.plugin]
+id = "author.gain"
+api_version = 2
+requires_pymss = ">=2.2"
+
+[[tool.pymss.plugin.operations]]
+id = "author.gain.apply"
+title = "Apply Gain"
+```
+
+`__init__.py`:
 
 ```python
-from pymss.plugins import register_capability, register_node, register_cli
+def run_gain(ctx, inputs, params):
+    audio = inputs["audio"]
+    gain = 10 ** (params["gain_db"] / 20.0)
+    return {"audio": type(audio)(
+        audio.audio * gain, audio.sample_rate, channel_layout=audio.channel_layout,
+    )}
 
-@register_capability("myplugin_denoise")
-def denoise(audio, sample_rate, strength=0.5):
-    ...                          # any numpy audio in/out
 
-@register_node("MyDenoiseNode")  # workflow node consuming the capability
-def denoise_node(ctx, inputs):
-    fn = ctx.require("myplugin_denoise")
-    ...
+def setup(plugin):
+    plugin.register_operation(
+        id="author.gain.apply",
+        title="Apply Gain",
+        inputs={"audio": {"type": "audio"}},
+        params={
+            "type": "object",
+            "properties": {
+                "gain_db": {"type": "number", "default": 0.0, "minimum": -60.0, "maximum": 60.0},
+            },
+            "additionalProperties": False,
+        },
+        outputs={"audio": {"type": "audio"}},
+        run=run_gain,
+    )
 ```
+
+```sh
+pymss plugins validate ./my-local-plugin
+pymss install ./my-local-plugin
+pymss ops describe author.gain.apply
+```
+
+The declared Operation ids must exactly match those registered by `setup()`. Register capabilities, nodes, and CLI commands inside `setup()` through `plugin.register_capability`, `plugin.register_node`, and `plugin.register_cli`. Plugins without a v2 manifest are not loaded. See the [plugin protocol](./docs/plugin-protocol.md) and [development guide](./docs/plugins.md) for details.
 
 A capability is a named function in a flat global pool; nodes/CLI/library calls look it up by name. Providers and consumers can ship in different packages, coupled only by the capability name — so someone adapting `SaveAudioOpus` reuses the `opus_encode` capability instead of rewriting the encoder.
 

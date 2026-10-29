@@ -206,15 +206,16 @@ pymss serve --webui
 
 pymss 有插件系统，用于扩展能力——音频 DSP 操作、音频编解码器、以及工作流节点。内置功能（23 个能力：15 个 DSP/声道操作 + 8 个编解码器）和插件用的是同一套注册机制，核心与扩展共用同一个能力池。
 
-**安装插件** —— 可用官方目录名、git URL 或本地路径。在 URL 后加 `#子目录` 可从 monorepo 子目录安装；用 `@tag` 锁定版本：
+**安装插件** —— 使用 pymss 2.2 或更新版本，通过官方目录中的完整插件 id、仓库 URL 或本地路径安装。在 URL 后加 `#子目录` 可从 monorepo 子目录安装：
 
 ```sh
-pymss install loudnorm                                   # 按官方目录名
-pymss install "https://github.com/xxx/repo#plugins/eq"   # URL + 子目录
-pymss install https://github.com/xxx/repo --subpath plugins/eq
+pymss install pymss.loudnorm                             # 完整插件 id
+pymss install "https://github.com/pymss-project/pymss-plugins#plugins/loudnorm"
+pymss install https://github.com/pymss-project/pymss-plugins --subpath plugins/loudnorm
 pymss install ./my-local-plugin
-pymss install loudnorm@v0.2.0                            # 锁定 git tag/branch/commit
 ```
+
+指定源码版本时使用 `pymss.loudnorm@<tag-or-commit>`，将占位符替换为源码仓库中实际存在的标签或完整提交 SHA。插件的包版本不代表仓库中一定存在同名 Git 标签。
 
 插件的依赖（在其 `pyproject.toml` 里声明）会**自动安装**到当前环境——venv 由 uv 管理时用 uv，否则用 pip。加 `--no-deps` 可跳过。
 
@@ -224,29 +225,69 @@ pymss install loudnorm@v0.2.0                            # 锁定 git tag/branch
 pymss plugins list           # 已装插件：版本、来源、加载状态
 pymss plugins available      # 浏览官方插件目录
 pymss plugins search loudness   # 按名称/描述/标签搜索目录
-pymss plugins update loudnorm   # 重装为最新版本
-pymss uninstall loudnorm
+pymss plugins update pymss.loudnorm   # 从记录的来源更新
+pymss uninstall pymss.loudnorm
 pymss plugins dir            # 打印插件目录
 ```
 
-`update` 对**官方插件和第三方（URL/路径装的）插件完全一样**——pymss 会记录每次安装的来源，所以更新时只需用插件文件夹名。
+`update` 对**官方插件和第三方（URL/路径装的）插件完全一样**——pymss 会记录每次安装的来源。更新和卸载命令使用清单中的插件 id，安装目录也以该 id 命名。
 
 插件放在 `~/.pymss/plugins/`（可用 `PYMSS_PLUGINS_DIR` 覆盖）。单个插件加载失败不会影响其他插件。官方插件目录是一个独立的 `pymss-plugins` 仓库（里面的 `registry.json` 以插件 id 为键）；插件需要 v2 清单，见 `docs/plugin-protocol.md`；可通过 `PYMSS_PLUGINS_REGISTRY` 指向自定义目录。
 
-**编写插件** —— 只需标准的 `pyproject.toml`（带 `[project].name`/`version`/`dependencies`），无需任何 pymss 专属字段。注册一个能力，pymss 会让它对 Python API、CLI 和工作流节点都可用：
+**编写插件** —— 在 `my-local-plugin/` 中创建 `pyproject.toml` 和 `__init__.py`。v2 清单声明插件身份，以及 `setup(plugin)` 注册的全部 Operation。
+
+`pyproject.toml`：
+
+```toml
+[project]
+name = "pymss-plugin-gain"
+version = "0.1.0"
+
+[tool.pymss.plugin]
+id = "author.gain"
+api_version = 2
+requires_pymss = ">=2.2"
+
+[[tool.pymss.plugin.operations]]
+id = "author.gain.apply"
+title = "Apply Gain"
+```
+
+`__init__.py`：
 
 ```python
-from pymss.plugins import register_capability, register_node, register_cli
+def run_gain(ctx, inputs, params):
+    audio = inputs["audio"]
+    gain = 10 ** (params["gain_db"] / 20.0)
+    return {"audio": type(audio)(
+        audio.audio * gain, audio.sample_rate, channel_layout=audio.channel_layout,
+    )}
 
-@register_capability("myplugin_denoise")
-def denoise(audio, sample_rate, strength=0.5):
-    ...                          # 输入输出都是 numpy 音频数组
 
-@register_node("MyDenoiseNode")  # 消费该能力的工作流节点
-def denoise_node(ctx, inputs):
-    fn = ctx.require("myplugin_denoise")
-    ...
+def setup(plugin):
+    plugin.register_operation(
+        id="author.gain.apply",
+        title="Apply Gain",
+        inputs={"audio": {"type": "audio"}},
+        params={
+            "type": "object",
+            "properties": {
+                "gain_db": {"type": "number", "default": 0.0, "minimum": -60.0, "maximum": 60.0},
+            },
+            "additionalProperties": False,
+        },
+        outputs={"audio": {"type": "audio"}},
+        run=run_gain,
+    )
 ```
+
+```sh
+pymss plugins validate ./my-local-plugin
+pymss install ./my-local-plugin
+pymss ops describe author.gain.apply
+```
+
+清单声明的 Operation id 必须与 `setup()` 实际注册的集合完全一致。能力、节点和 CLI 命令同样在 `setup()` 内，通过 `plugin.register_capability`、`plugin.register_node` 和 `plugin.register_cli` 注册。没有 v2 清单的插件不再加载，详见[插件协议](./docs/plugin-protocol.md)和[开发指南](./docs/plugins.md)。
 
 能力是注册在扁平全局池里的具名函数；节点/CLI/库调用都按名字查找。提供者和消费者可以分别打包，仅通过能力名耦合——例如适配 `SaveAudioOpus` 节点时，可以直接复用已有的 `opus_encode` 能力，而不是重写编码器。
 
