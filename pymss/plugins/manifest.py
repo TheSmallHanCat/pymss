@@ -259,9 +259,15 @@ def read_manifest(plugin_dir: Path) -> PluginManifest:
         raise ManifestError(f"missing pyproject.toml with [tool.pymss.plugin]; {MIGRATION_HINT}")
     try:
         data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-    except (tomllib.TOMLDecodeError, OSError) as exc:
+    except (tomllib.TOMLDecodeError, OSError, UnicodeError) as exc:
         raise ManifestError(f"cannot read pyproject.toml: {exc}") from exc
-    section = data.get("tool", {}).get("pymss", {}).get("plugin")
+    tool = data.get("tool", {})
+    if not isinstance(tool, dict):
+        raise ManifestError("tool must be a table")
+    pymss_section = tool.get("pymss", {})
+    if not isinstance(pymss_section, dict):
+        raise ManifestError("tool.pymss must be a table")
+    section = pymss_section.get("plugin")
     if not isinstance(section, dict) or not section:
         raise ManifestError(f"missing [tool.pymss.plugin]; {MIGRATION_HINT}")
 

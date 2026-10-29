@@ -1060,19 +1060,21 @@ def build_parser():
 def main(argv=None):
     """Run the pymss command-line interface.
 
-    Loads user plugins first so their registered CLI subcommands exist before
-    argument parsing, then mounts any plugin-registered commands that do not
-    collide with builtin subparsers.
+    Manifest validation skips plugin loading. Other commands load user plugins
+    before argument parsing so their registered CLI subcommands are available
+    without replacing builtin subparsers.
     """
-    from .plugins import ensure_plugins_loaded, get_registry
-
+    arguments = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
-    try:
-        ensure_plugins_loaded()
-    except Exception as exc:  # noqa: BLE001 - plugin load errors must not kill the CLI
-        print(f"pymss: warning: plugin loading failed: {exc}", file=sys.stderr)
-    _mount_plugin_cli_commands(parser)
-    args = parser.parse_args(argv)
+    if arguments[:2] != ["plugins", "validate"]:
+        from .plugins import ensure_plugins_loaded
+
+        try:
+            ensure_plugins_loaded()
+        except Exception as exc:  # noqa: BLE001 - plugin load errors must not kill the CLI
+            print(f"pymss: warning: plugin loading failed: {exc}", file=sys.stderr)
+        _mount_plugin_cli_commands(parser)
+    args = parser.parse_args(arguments)
     try:
         return args.func(args)
     except Exception as exc:

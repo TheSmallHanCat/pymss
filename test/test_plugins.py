@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import textwrap
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -596,3 +598,117 @@ def test_install_writes_manifest(monkeypatch, tmp_path):
     assert manifest["source"] == "registry"
     assert manifest["url"] == "https://example.com/r.git"
     assert manifest["subpath"] == "p/x"
+
+
+def _plugin_files(directory):
+    return {path.relative_to(directory): path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+
+
+@pytest.fixture
+def installed_update(tmp_path):
+    source = _write_plugin(tmp_path / "source", "author.updated", "VALUE = 1\n")
+    result = install(str(source), plugins_dir=tmp_path / "installed", no_deps=True)
+    return source, result.path
+
+
+@pytest.mark.parametrize("source_kind", ["path", "url"])
+def test_update_rejects_changed_identity_before_installing_dependencies(installed_update, monkeypatch, source_kind):
+    from pymss.plugins import install as install_mod
+
+    source, destination = installed_update
+    if source_kind == "url":
+        install_record = destination / ".pymss-install.json"
+        record = json.loads(install_record.read_text())
+        record.update(source="url", url="https://github.com/owner/plugin")
+        install_record.write_text(json.dumps(record))
+
+        def clone(url, dest, subpath=None, ref=None):
+            _write_plugin(dest, "author.other")
+            (dest / "pyproject.toml").write_text(
+                _manifest("author.other").replace('[project]\n', '[project]\ndependencies = ["unwanted>=1"]\n')
+            )
+            return {"resolved_commit": "a" * 40}
+
+        monkeypatch.setattr(install_mod, "_clone", clone)
+    else:
+        (source / "pyproject.toml").write_text(
+            _manifest("author.other").replace('[project]\n', '[project]\ndependencies = ["unwanted>=1"]\n')
+        )
+    previous = _plugin_files(destination)
+    dependencies = Mock()
+    monkeypatch.setattr(install_mod, "_install_dependencies", dependencies)
+    with pytest.raises(InstallError, match="update for 'author.updated' contains plugin 'author.other'"):
+        install_mod.update("author.updated", plugins_dir=destination.parent)
+    dependencies.assert_not_called()
+    assert _plugin_files(destination) == previous
+    assert list(destination.parent.iterdir()) == [destination]
+
+
+@pytest.mark.parametrize("failure", ["manifest", "dependencies"])
+def test_update_preparation_failure_preserves_original(installed_update, monkeypatch, failure):
+    from pymss.plugins import install as install_mod
+
+    source, destination = installed_update
+    previous = _plugin_files(destination)
+    dependencies = Mock()
+    monkeypatch.setattr(install_mod, "_install_dependencies", dependencies)
+    if failure == "manifest":
+        (source / "pyproject.toml").write_text("tool = []\n")
+        message = "not a pymss v2 plugin"
+    else:
+        (source / "pyproject.toml").write_text(
+            _manifest("author.updated", "0.2.0").replace('[project]\n', '[project]\ndependencies = ["dependency>=2"]\n')
+        )
+        message = "dependency preparation failed"
+        dependencies.side_effect = InstallError(message)
+    with pytest.raises(InstallError, match=message):
+        install_mod.update("author.updated", plugins_dir=destination.parent)
+    if failure == "manifest":
+        dependencies.assert_not_called()
+    else:
+        dependencies.assert_called_once_with(["dependency>=2"])
+    assert _plugin_files(destination) == previous
+    assert list(destination.parent.iterdir()) == [destination]
+
+
+def test_update_restores_original_when_candidate_rename_fails(installed_update, monkeypatch):
+    from pymss.plugins import install as install_mod
+
+    source, destination = installed_update
+    previous = _plugin_files(destination)
+    _write_plugin(source, "author.updated", "VALUE = 2\n", version="0.2.0")
+    monkeypatch.setattr(install_mod, "_install_dependencies", Mock())
+    rename = Path.rename
+    failed_candidates = []
+
+    def fail_candidate(path, target):
+        if path.name == "author.updated" and path.parent.name.startswith(".update-"):
+            assert not destination.exists()
+            assert len(list(destination.parent.glob(".previous-author.updated-*"))) == 1
+            failed_candidates.append(path)
+            raise OSError("candidate rename failed")
+        return rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", fail_candidate)
+    with pytest.raises(OSError, match="candidate rename failed"):
+        install_mod.update("author.updated", plugins_dir=destination.parent)
+    assert len(failed_candidates) == 1
+    assert _plugin_files(destination) == previous
+    assert list(destination.parent.iterdir()) == [destination]
+
+
+def test_update_replaces_plugin_and_cleans_staging(installed_update, monkeypatch):
+    from pymss.plugins import install as install_mod
+
+    source, destination = installed_update
+    _write_plugin(source, "author.updated", "VALUE = 2\n", version="0.2.0")
+    dependencies = Mock()
+    monkeypatch.setattr(install_mod, "_install_dependencies", dependencies)
+    result = install_mod.update("author.updated", plugins_dir=destination.parent)
+    assert result.path == destination
+    assert result.name == "author.updated"
+    assert result.version == "0.2.0"
+    assert (destination / "__init__.py").read_bytes() == (source / "__init__.py").read_bytes()
+    assert json.loads((destination / ".pymss-install.json").read_text())["version"] == "0.2.0"
+    dependencies.assert_called_once_with([])
+    assert list(destination.parent.iterdir()) == [destination]

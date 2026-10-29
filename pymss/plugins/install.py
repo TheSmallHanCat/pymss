@@ -274,6 +274,8 @@ def install(
     ref: str | None = None,
     no_deps: bool = False,
     registry_url: str | None = None,
+    *,
+    expected_plugin_id: str | None = None,
 ) -> InstallResult:
     """Install a plugin by registry id, URL, or local path.
 
@@ -282,7 +284,8 @@ def install(
     URLs, a trailing ``#path/to/subdir`` also selects a subdirectory (takes
     precedence over the subpath argument). ref checks out a git
     tag/branch/commit (e.g. from ``id@0.2.0``). Dependencies from
-    pyproject.toml are installed unless no_deps is True.
+    pyproject.toml are installed unless no_deps is True. When expected_plugin_id
+    is provided, the manifest must match before any dependencies are installed.
     """
     plugins_dir = plugins_dir or get_plugins_dir()
     plugins_dir.mkdir(parents=True, exist_ok=True)
@@ -356,6 +359,8 @@ def install(
         name = manifest.plugin_id
         if source == "registry" and name != arg:
             raise InstallError(f"registry entry '{arg}' installed plugin id '{name}'")
+        if expected_plugin_id is not None and name != expected_plugin_id:
+            raise InstallError(f"update for '{expected_plugin_id}' contains plugin '{name}'")
         dest = plugins_dir / name
         if dest.exists():
             raise InstallError(f"destination already exists: {dest} (uninstall it first)")
@@ -541,9 +546,8 @@ def update(name: str, plugins_dir: Path | None = None) -> InstallResult:
         candidate = install(
             name if source == "registry" else url,
             plugins_dir=Path(temporary), subpath=subpath, registry_url=registry_url,
+            expected_plugin_id=name,
         )
-        if candidate.name != name:
-            raise InstallError(f"update for '{name}' contains plugin '{candidate.name}'")
         backup = plugins_dir / f".previous-{name}-{uuid4().hex}"
         dest.rename(backup)
         try:

@@ -87,6 +87,10 @@ entry = "ui/missing.html"
     def test_invalid_fields_are_rejected(self):
         head = '[tool.pymss.plugin]\nid = "a.b"\napi_version = 2\n\n'
         cases = {
+            "tool-array": 'tool = []\n',
+            "tool-string": 'tool = "invalid"\n',
+            "pymss-array": '[tool]\npymss = []\n',
+            "pymss-string": '[tool]\npymss = "invalid"\n',
             "bad-id": '[tool.pymss.plugin]\nid = "Not Valid"\napi_version = 2\n',
             "api-v1": '[tool.pymss.plugin]\nid = "a.b"\napi_version = 1\n',
             "api-string": '[tool.pymss.plugin]\nid = "a.b"\napi_version = "2"\n',
@@ -99,6 +103,12 @@ entry = "ui/missing.html"
         for name, body in cases.items():
             with self.subTest(case=name), self.assertRaises(ManifestError):
                 read_manifest(self.write(name, body))
+
+    def test_invalid_utf8_is_reported_as_a_manifest_error(self):
+        plugin = self.write("bad-encoding", "")
+        (plugin / "pyproject.toml").write_bytes(b"\xff\xfe")
+        with self.assertRaisesRegex(ManifestError, "cannot read pyproject.toml"):
+            read_manifest(plugin)
 
     def test_version_constraints(self):
         self.assertTrue(satisfies("1.2.0", ">=1,<2"))
@@ -189,6 +199,28 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("author.util.run", runtime.list_operations()[0]["id"].join([]) or
                       [op["id"] for op in runtime.list_operations()])
         self.assertTrue(by_id["author.util"]["loaded"])
+
+    def test_malformed_manifests_do_not_block_healthy_neighbors(self):
+        malformed = {
+            "bad-encoding": b"\xff\xfe",
+            "bad-tool": b"tool = []\n",
+            "bad-pymss": b"[tool]\npymss = []\n",
+        }
+        for name, content in malformed.items():
+            directory = self.plugin(name, f"author.{name}", "1.0.0")
+            (directory / "pyproject.toml").write_bytes(content)
+        self.plugin("healthy", "author.healthy", "1.0.0")
+        manager = PluginManager(self.root)
+        states = {state.name: state for state in manager.discover()}
+        for name in malformed:
+            self.assertEqual(states[name].status, "blocked")
+            self.assertTrue(states[name].error)
+        manager.resolve()
+        runtime = ops.Runtime()
+        rows = manager.activate(lambda source: ops._RuntimePluginHandle(runtime, source=source))
+        healthy = next(row for row in rows if row["plugin_id"] == "author.healthy")
+        self.assertEqual(healthy["status"], "activated")
+        self.assertIn("author.healthy.run", [operation["id"] for operation in runtime.list_operations()])
 
     def test_missing_and_version_unsatisfied_dependencies_block(self):
         self.plugin("needs", "author.needs", "1.0.0", deps={"author.gone": ">=1"})
@@ -475,16 +507,52 @@ class LifecycleTests(unittest.TestCase):
 
     def test_cli_validate_reads_the_manifest_without_running_code(self):
         import pymss.cli as cli
+        import pymss.plugins as plugins
 
-        directory = self.plugin("checked", "author.checked", "1.0.0", body="raise RuntimeError('must not run')\n")
+        directories = []
+        for name in ("checked", "neighbor"):
+            directories.append(self.plugin(name, f"author.{name}", "1.0.0", body=(
+                "from pathlib import Path\n"
+                "Path(__file__).with_name('imported.txt').write_text('imported')\n"
+                "def setup(plugin):\n"
+                "    Path(__file__).with_name('setup.txt').write_text('setup')\n"
+                f"    plugin.register_operation(id='author.{name}.run', inputs={{}}, "
+                "params={'type':'object','properties':{}}, outputs={}, run=lambda c,i,p: {})\n"
+            )))
+        directory = directories[0]
+        self.addCleanup(plugins.reset)
         output = io.StringIO()
-        with redirect_stdout(output):
-            self.assertEqual(cli.main(["plugins", "validate", str(directory)]), 0)
+        arguments = ["plugins", "validate", str(directory)]
+        for explicit_arguments in (True, False):
+            with self.subTest(explicit_arguments=explicit_arguments):
+                plugins.reset()
+                ops._DEFAULT_RUNTIME = None
+                with patch.object(sys, "argv", ["pymss", *arguments]), redirect_stdout(output):
+                    self.assertEqual(cli.main(arguments if explicit_arguments else None), 0)
+                for plugin_dir in directories:
+                    self.assertFalse((plugin_dir / "imported.txt").exists())
+                    self.assertFalse((plugin_dir / "setup.txt").exists())
         self.assertIn("author.checked 1.0.0 (api_version 2)", output.getvalue())
         self.assertIn("author.checked.run", output.getvalue())
         (directory / "pyproject.toml").write_text('[tool.pymss.plugin]\nid = "author.checked"\napi_version = 1\n', encoding="utf-8")
         with redirect_stdout(io.StringIO()):
             self.assertEqual(cli.main(["plugins", "validate", str(directory)]), 1)
+        for plugin_dir in directories:
+            self.assertFalse((plugin_dir / "imported.txt").exists())
+            self.assertFalse((plugin_dir / "setup.txt").exists())
+
+    def test_cli_still_loads_plugin_commands(self):
+        import pymss.cli as cli
+        import pymss.plugins as plugins
+
+        self.plugin("commands", "author.commands", "1.0.0", operations=[], body=(
+            "def setup(plugin):\n"
+            "    plugin.register_cli(('plugin-command',), lambda args: 17)\n"
+        ))
+        plugins.reset()
+        self.addCleanup(plugins.reset)
+        ops._DEFAULT_RUNTIME = None
+        self.assertEqual(cli.main(["plugin-command"]), 17)
 
 
 class GraphOperationTests(unittest.TestCase):
