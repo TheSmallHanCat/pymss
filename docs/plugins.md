@@ -7,12 +7,28 @@ pymss 2.2+ 采用双层扩展模型（见 [plugin-redesign-plan.md](plugin-redes
 
 ## 快速开始：写一个操作插件
 
-在 `~/.pymss/plugins/myplugin/__init__.py`（或 `PYMSS_PLUGINS_DIR` 指定目录）：
+在 `~/.pymss/plugins/myplugin/`（或 `PYMSS_PLUGINS_DIR` 指定目录）放两个文件。`pyproject.toml` 声明插件身份和它注册的操作（[插件协议 v2](plugin-protocol.md)）：
+
+```toml
+[project]
+name = "pymss-plugin-myplugin"
+version = "0.1.0"
+
+[tool.pymss.plugin]
+id = "myplugin"
+api_version = 2
+
+[[tool.pymss.plugin.operations]]
+id = "myplugin.gain"
+title = "Apply Gain"
+```
+
+`__init__.py` 中的 `setup()` 注册同一个操作：
 
 ```python
 def setup(plugin):
     plugin.register_operation(
-        id="myplugin.gain",                 # 反向域名风格，至少一个点
+        id="myplugin.gain",                 # 以插件 id 加点开头
         schema_version=1,
         title="Apply Gain",
         inputs={"audio": {"type": "audio"}},
@@ -36,7 +52,7 @@ def run_gain(ctx, inputs, params):
     return {"audio": type(audio)(out, audio.sample_rate, channel_layout=audio.channel_layout)}
 ```
 
-`setup()` 失败时该插件的所有注册会被回滚，错误进入加载报告。
+`setup()` 失败，或注册的操作与清单声明不一致时，该插件的所有注册会被回滚，错误进入加载报告。用 `pymss plugins validate <目录>` 可以在不执行代码的情况下检查清单。
 
 ## 参数 schema
 
@@ -85,6 +101,6 @@ svc.resample(audio, 44100, 48000)        # 所有通用路径（图、保存转�
 
 同名冲突：`register_resampler` 默认拒绝重复注册（传 `replace=True` 覆盖）；能力（capability）注册表同样不再允许内置编码器覆盖插件实现。
 
-## 旧协议兼容
+## capability / node / CLI
 
-无 `setup()` 的插件继续按 import 副作用注册 capability/node/cli（全局注册表）；`register_cli` 的命令现在会真实挂载到 `pymss` CLI（与内置命令同名则跳过并告警）。
+插件在 `setup(plugin)` 中通过 `plugin.register_capability` / `plugin.register_node` / `plugin.register_cli` 注册到全局注册表；`register_cli` 的命令会挂载到 `pymss` CLI（与内置命令同名则跳过并告警）。没有 v2 清单的插件不再加载，迁移方式见 [plugin-protocol.md](plugin-protocol.md#migrating-from-v1)。

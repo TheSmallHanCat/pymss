@@ -81,7 +81,7 @@ def register_operation_node(
         from . import OperationContext
 
         op_ctx = OperationContext(
-            progress=lambda fraction, message="": ctx.report_progress(
+            progress=lambda fraction, message="", event=None: ctx.report_progress(
                 node, float(fraction), message or f"operation {spec.id}"
             ) if node is not None else None,
             logger=ctx.logger,
