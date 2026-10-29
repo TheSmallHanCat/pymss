@@ -151,7 +151,9 @@ def _extract_archive(archive: Path, destination: Path, subpath: str | None) -> N
             seen: set[str] = set()
             files: list[tuple[zipfile.ZipInfo, tuple[str, ...]]] = []
             for entry in entries:
-                parts = _relative_parts(entry.filename)
+                # zipfile normalizes separators and truncates NULs in filename.
+                # Validate the stored name before accepting that normalization.
+                parts = _relative_parts(entry.orig_filename)
                 root = root or parts[0]
                 if parts[0] != root:
                     raise SourceError("GitHub archive contains multiple root directories.")

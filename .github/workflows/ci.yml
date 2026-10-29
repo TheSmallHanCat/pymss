@@ -14,16 +14,24 @@ concurrency:
 
 jobs:
   macos-plugins:
-    name: macOS plugin and audio contracts
+    name: ${{ matrix.name }}
     runs-on: macos-14
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.12"
+            name: macOS plugin and audio contracts
+          - python: "3.11"
+            name: macOS plugin and audio contracts (Python 3.11)
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
       - name: Install audio tools
         run: command -v ffmpeg && command -v ffprobe || brew install ffmpeg
       - name: Install package and test dependencies

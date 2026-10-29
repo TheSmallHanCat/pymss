@@ -4,6 +4,8 @@
 
 ## 安装
 
+pymss 2.2 及后续版本要求 Python 3.11 或更高版本。
+
 如果想安装 CUDA 版 PyTorch，推荐先运行：
 
 ```sh
@@ -50,7 +52,7 @@ pip install "pymss[server]"
 
 ## 开发
 
-开发需要 Git、Python 3.10 或更高版本，以及 [uv](https://docs.astral.sh/uv/)。WebUI 开发还需要 Node.js 和 npm。
+开发需要 Git、Python 3.11 或更高版本，以及 [uv](https://docs.astral.sh/uv/)。WebUI 开发还需要 Node.js 和 npm。
 
 克隆 Python 包仓库，并安装开发依赖：
 

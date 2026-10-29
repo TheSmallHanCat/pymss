@@ -130,6 +130,8 @@ plugin.register_operation(
 
 ## Migrating from v1
 
+pymss 2.2 的最低 Python 版本为 3.11，升级前请确认宿主使用的解释器满足要求。
+
 v2 是破坏性升级，v1 插件和无清单插件都不再加载：
 
 | v1 | v2 |
