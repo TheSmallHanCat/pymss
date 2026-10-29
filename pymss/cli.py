@@ -188,6 +188,21 @@ def cmd_plugins(args):
         print(get_plugins_dir())
         return 0
 
+    if cmd == "validate":
+        from pathlib import Path
+
+        from .plugins.manifest import ManifestError, read_manifest
+
+        try:
+            manifest = read_manifest(Path(args.path))
+        except ManifestError as exc:
+            print(f"pymss plugins validate: error: {exc}", file=sys.stderr)
+            return 1
+        print(f"{manifest.plugin_id} {manifest.version or '?'} (api_version {manifest.api_version})")
+        for operation in manifest.operations:
+            print(f"  operation {operation.id}  {operation.title}")
+        return 0
+
     if cmd == "available":
         try:
             entries = list_available()
@@ -761,7 +776,11 @@ def build_parser():
     update_parser = plugins_subparsers.add_parser(
         "update", help="Reinstall a plugin at its latest version."
     )
-    update_parser.add_argument("name", help="Name of the installed plugin to update.")
+    update_parser.add_argument("name", help="Plugin id of the installed plugin to update.")
+    validate_parser = plugins_subparsers.add_parser(
+        "validate", help="Check a plugin directory's v2 manifest without running its code."
+    )
+    validate_parser.add_argument("path", help="Plugin directory containing pyproject.toml.")
     plugins_parser.set_defaults(func=cmd_plugins, plugins_command="list")
 
     # ==========================

@@ -1,11 +1,14 @@
 """Plugin install / uninstall.
 
 Three install sources:
-  pymss install <name>     -> resolve <name> via official registry, git clone
-  pymss install <url>      -> git clone the repo URL directly
-  pymss install <path>     -> copy or symlink a local directory
+  pymss install <id>       -> resolve <id> via the plugin registry
+  pymss install <url>      -> download the repository source
+  pymss install <path>     -> copy a local directory
 
-Version pinning: `pymss install <name>@<ref>` checks out a git ref (tag/branch/commit).
+Every source is staged, validated as a v2 manifest, and published under
+``<plugins_dir>/<plugin_id>``.
+
+Version pinning: `pymss install <id>@<ref>` checks out a git ref (tag/branch/commit).
 Dependencies: read from the plugin's pyproject.toml [project].dependencies and
 installed via uv (preferred for uv-managed venvs) or pip.
 """
@@ -19,25 +22,34 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from .loader import get_plugins_dir
+from .manifest import ManifestError, read_manifest
+from .sources import (
+    SourceError,
+    download_github_source,
+    github_repository,
+    read_github_file,
+    resolve_github_commit,
+)
 
 logger = logging.getLogger(__name__)
 
-# Default official registry URL. The pymss-plugins repo doesn't exist yet;
-# install-by-name will report a clear error until it does. Users can override
-# via PYMSS_PLUGINS_REGISTRY env var, or just install by URL/path.
+# Hosts pass ``registry_url`` explicitly; CLI users can set PYMSS_PLUGINS_REGISTRY.
 DEFAULT_REGISTRY_URL = (
     "https://raw.githubusercontent.com/pymss-project/pymss-plugins/main/registry.json"
 )
 
 
-def _registry_url() -> str:
-    return os.environ.get("PYMSS_PLUGINS_REGISTRY", DEFAULT_REGISTRY_URL)
+def _registry_url(explicit: str | None = None) -> str:
+    return explicit or os.environ.get("PYMSS_PLUGINS_REGISTRY", DEFAULT_REGISTRY_URL)
 
 
 class InstallError(Exception):
@@ -61,9 +73,9 @@ def _git_available() -> bool:
     return shutil.which("git") is not None
 
 
-def _fetch_registry() -> dict[str, str]:
-    """Fetch and parse the official registry JSON. Raises InstallError on failure."""
-    url = _registry_url()
+def _fetch_registry(registry_url: str | None = None) -> dict[str, str]:
+    """Fetch and parse the registry JSON. Raises InstallError on failure."""
+    url = _registry_url(registry_url)
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "pymss"})
         with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310
@@ -78,65 +90,47 @@ def _fetch_registry() -> dict[str, str]:
     return data
 
 
-def _derive_plugin_name(arg: str) -> str:
-    """Derive a plugin folder name from a URL or local path."""
-    base = arg.rstrip("/").split("/")[-1]
-    if base.endswith(".git"):
-        base = base[:-4]
-    # Common prefix convention; keep the full name if it doesn't match.
-    for prefix in ("pymss-", "pymss_"):
-        if base.startswith(prefix):
-            return base[len(prefix):]
-    return base
+def _clone(url: str, dest: Path, subpath: str | None = None, ref: str | None = None) -> dict:
+    """Acquire one plugin directory and record the actual source commit.
 
-
-def _clone(url: str, dest: Path, subpath: str | None = None, ref: str | None = None) -> None:
-    """Clone a repo (shallow). If subpath is given, only that subdir is kept.
-    If ref is given, check out that tag/branch/commit after cloning.
-
-    For monorepo-style plugin collections (e.g. pymss-plugins with one subdir
-    per plugin), we clone to a temp dir then copy the subdir out, so the
-    installed plugin directory contains just that plugin — not the whole repo.
+    Public HTTPS GitHub repositories use commit-pinned archives. Other hosts
+    and SSH sources use Git, with the same default-branch or explicit-ref policy.
     """
+    try:
+        if github_repository(url):
+            return download_github_source(url, dest, subpath=subpath, ref=ref)
+    except SourceError as exc:
+        raise InstallError(str(exc)) from exc
     if not _git_available():
-        raise InstallError("git is required to install plugins from a URL; please install git first.")
+        raise InstallError("git is required for non-GitHub or SSH plugin sources; install git or use a public HTTPS GitHub URL.")
     if dest.exists():
         raise InstallError(f"destination already exists: {dest} (uninstall it first)")
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    clone_cmd = ["git", "clone", "--depth", "1"]
-    if ref:
-        clone_cmd += ["--branch", ref]
-    clone_cmd += [url]
-
-    if subpath:
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_repo = Path(tmp) / "repo"
-            try:
-                subprocess.run(  # noqa: S603, S607
-                    clone_cmd + [str(tmp_repo)],
-                    check=True, capture_output=True, text=True,
-                )
-            except subprocess.CalledProcessError as exc:
-                hint = "" if not ref else f" (check that ref {ref!r} exists on the remote)"
-                raise InstallError(f"git clone failed:{hint} {exc.stderr.strip() or exc}") from exc
-            subdir = tmp_repo / subpath
-            if not subdir.is_dir():
-                raise InstallError(
-                    f"plugin subpath {subpath!r} not found in {url} (checked {subdir})"
-                )
-            shutil.copytree(subdir, dest, ignore=shutil.ignore_patterns(".git"))
-    else:
+    with tempfile.TemporaryDirectory(prefix="pymss-git-") as temporary:
+        repo = Path(temporary) / "repo"
         try:
-            subprocess.run(  # noqa: S603, S607
-                clone_cmd + [str(dest)],
-                check=True, capture_output=True, text=True,
-            )
-        except subprocess.CalledProcessError as exc:
-            hint = "" if not ref else f" (check that ref {ref!r} exists on the remote)"
-            raise InstallError(f"git clone failed:{hint} {exc.stderr.strip() or exc}") from exc
+            def git(*args: str) -> str:
+                return subprocess.run(  # noqa: S603, S607
+                    ["git", *args], check=True, capture_output=True, text=True, timeout=180,
+                ).stdout.strip()
+
+            if ref:
+                git("init", str(repo))
+                git("-C", str(repo), "remote", "add", "origin", url)
+                git("-C", str(repo), "fetch", "--depth", "1", "origin", ref)
+                git("-C", str(repo), "checkout", "--detach", "FETCH_HEAD")
+            else:
+                git("clone", "--depth", "1", url, str(repo))
+            commit = git("-C", str(repo), "rev-parse", "HEAD")
+        except (subprocess.SubprocessError, OSError) as exc:
+            detail = exc.stderr.strip() if isinstance(exc, subprocess.CalledProcessError) else str(exc)
+            raise InstallError(f"git source acquisition failed: {detail}") from exc
+        selected = (repo / subpath).resolve() if subpath else repo.resolve()
+        if not selected.is_relative_to(repo.resolve()) or not selected.is_dir():
+            raise InstallError(f"plugin subpath {subpath!r} is not a directory within the source repository")
+        shutil.copytree(selected, dest, ignore=shutil.ignore_patterns(".git"))
+        return {"url": url, "ref": ref, "resolved_commit": commit}
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +152,10 @@ def _read_plugin_meta(plugin_dir: Path) -> dict:
     pp = plugin_dir / "pyproject.toml"
     if not pp.exists():
         return {}
-    txt = pp.read_text(encoding="utf-8")
+    return _parse_plugin_meta(pp.read_text(encoding="utf-8"))
+
+
+def _parse_plugin_meta(txt: str) -> dict:
     meta = {}
     if m := _PYPROJECT_NAME_RE.search(txt):
         meta["name"] = m.group(1)
@@ -233,7 +230,8 @@ def _install_dependencies(deps: list[str]) -> None:
 
 def _write_install_manifest(
     plugin_dir: Path, *, name: str, source: str, url: str | None,
-    subpath: str | None, ref: str | None, meta: dict,
+    subpath: str | None, ref: str | None, meta: dict, registry_url: str | None,
+    resolved_commit: str | None,
 ) -> None:
     """Write .pymss-install.json so update/list can identify the install."""
     manifest = {
@@ -243,6 +241,8 @@ def _write_install_manifest(
         "url": url,
         "subpath": subpath,
         "ref": ref,
+        "resolved_commit": resolved_commit,
+        "registry_url": registry_url,
         "installed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     (plugin_dir / ".pymss-install.json").write_text(
@@ -273,91 +273,103 @@ def install(
     subpath: str | None = None,
     ref: str | None = None,
     no_deps: bool = False,
+    registry_url: str | None = None,
 ) -> InstallResult:
-    """Install a plugin by name, URL, or local path.
+    """Install a plugin by registry id, URL, or local path.
 
-    subpath overrides the auto-detected subdirectory. For URLs, a trailing
-    ``#path/to/subdir`` also selects a subdirectory (takes precedence over the
-    subpath argument). ref checks out a git tag/branch/commit (e.g. from
-    ``name@0.2.0``). Dependencies from pyproject.toml are installed unless
-    no_deps is True. Returns InstallResult with the resolved name and path.
+    The plugin lands in ``plugins_dir/<plugin_id>`` (the manifest id, not the
+    source folder name). subpath overrides the auto-detected subdirectory. For
+    URLs, a trailing ``#path/to/subdir`` also selects a subdirectory (takes
+    precedence over the subpath argument). ref checks out a git
+    tag/branch/commit (e.g. from ``id@0.2.0``). Dependencies from
+    pyproject.toml are installed unless no_deps is True.
     """
     plugins_dir = plugins_dir or get_plugins_dir()
     plugins_dir.mkdir(parents=True, exist_ok=True)
 
-    # `name@ref` syntax: split off a git ref for registry/url installs.
-    if ref is None and "@" in arg and not arg.startswith(("/", ".", "~")):
+    # `id@ref` syntax applies to registry ids, not SSH credentials.
+    if ref is None and not _is_url(arg) and "@" in arg and not arg.startswith(("/", ".", "~")):
         arg, ref = arg.rsplit("@", 1)
 
-    installed_deps: list[str] = []
-
-    if _is_url(arg):
-        # A trailing #path selects a subdirectory of the repo.
-        if "#" in arg:
-            url_part, frag = arg.rsplit("#", 1)
-            subpath = frag or subpath
-            arg = url_part
-        name = subpath.rstrip("/").split("/")[-1] if subpath else _derive_plugin_name(arg)
-        dest = plugins_dir / name
-        _clone(arg, dest, subpath=subpath or None, ref=ref)
-        meta = _read_plugin_meta(dest)
-        if not no_deps:
-            _install_dependencies(meta.get("dependencies", []))
-            installed_deps = meta.get("dependencies", [])
-        _write_install_manifest(dest, name=name, source="url", url=arg,
-                                subpath=subpath, ref=ref, meta=meta)
-        return InstallResult(name=name, path=dest, source="url",
-                             version=meta.get("version"), dependencies_installed=installed_deps)
-
-    local = Path(arg).expanduser()
-    if local.exists() and local.is_dir():
-        if subpath:
-            local = local / subpath
-            if not local.is_dir():
+    with tempfile.TemporaryDirectory(prefix=".staging-", dir=plugins_dir) as temporary:
+        staged = Path(temporary) / "plugin"
+        resolved_registry_url = None
+        source_meta = {}
+        local = Path(arg).expanduser()
+        if _is_url(arg):
+            # A trailing #path selects a subdirectory of the repo.
+            if "#" in arg:
+                url_part, frag = arg.rsplit("#", 1)
+                subpath = frag or subpath
+                arg = url_part
+            # Ref suffixes belong to the repository path, never to user@host.
+            parsed = urllib.parse.urlsplit(arg) if "://" in arg else None
+            if parsed is None:
+                remote, _, path = arg.partition(":")
+            else:
+                path = parsed.path
+            if "@" in path:
+                path, url_ref = path.rsplit("@", 1)
+                if not url_ref:
+                    raise InstallError("repository ref must not be empty")
+                if ref is None:
+                    ref = url_ref
+                arg = urllib.parse.urlunsplit(parsed._replace(path=path)) if parsed else f"{remote}:{path}"
+            source_meta = _clone(arg, staged, subpath=subpath or None, ref=ref)
+            source, url = "url", arg
+        elif local.exists() and local.is_dir():
+            if subpath:
+                local = local / subpath
+                if not local.is_dir():
+                    raise InstallError(
+                        f"plugin subpath {subpath!r} not found under {arg} (checked {local})"
+                    )
+            _copy_dir(local, staged)
+            source, url = "path", str(Path(arg).resolve())
+        else:
+            # Otherwise treat arg as an id in the plugin registry.
+            resolved_registry_url = _registry_url(registry_url)
+            registry = _fetch_registry(resolved_registry_url)
+            if arg not in registry:
+                available = ", ".join(sorted(key for key in registry if not key.startswith("_"))) or "(empty)"
                 raise InstallError(
-                    f"plugin subpath {subpath!r} not found under {arg} (checked {local})"
+                    f"'{arg}' is not in the plugin registry. "
+                    f"Available: {available}. Or install by URL/path."
                 )
-        name = local.name
+            entry = registry[arg]
+            # Registry entries may be either a plain URL string, or an object
+            # {"url": ..., "subpath": ...} for monorepo plugin collections.
+            if isinstance(entry, dict):
+                url = entry.get("url", "")
+                subpath = entry.get("subpath") or subpath
+                if not url:
+                    raise InstallError(f"registry entry for '{arg}' has no 'url' field")
+            else:
+                url = str(entry)
+            source_meta = _clone(url, staged, subpath=subpath, ref=ref)
+            source = "registry"
+
+        try:
+            manifest = read_manifest(staged)
+        except ManifestError as exc:
+            raise InstallError(f"not a pymss v2 plugin: {exc}") from exc
+        name = manifest.plugin_id
+        if source == "registry" and name != arg:
+            raise InstallError(f"registry entry '{arg}' installed plugin id '{name}'")
         dest = plugins_dir / name
-        _copy_dir(local, dest)
-        meta = _read_plugin_meta(dest)
+        if dest.exists():
+            raise InstallError(f"destination already exists: {dest} (uninstall it first)")
+        meta = _read_plugin_meta(staged)
+        installed_deps: list[str] = []
         if not no_deps:
             _install_dependencies(meta.get("dependencies", []))
             installed_deps = meta.get("dependencies", [])
-        _write_install_manifest(dest, name=name, source="path",
-                                url=str(Path(arg).resolve()),
-                                subpath=subpath, ref=ref, meta=meta)
-        return InstallResult(name=name, path=dest, source="path",
+        _write_install_manifest(staged, name=name, source=source, url=url,
+                                subpath=subpath, ref=ref, meta=meta, registry_url=resolved_registry_url,
+                                resolved_commit=source_meta.get("resolved_commit"))
+        staged.rename(dest)
+        return InstallResult(name=name, path=dest, source=source,
                              version=meta.get("version"), dependencies_installed=installed_deps)
-
-    # Otherwise treat arg as an official registry name.
-    registry = _fetch_registry()
-    if arg not in registry:
-        available = ", ".join(sorted(registry.keys())) or "(empty)"
-        raise InstallError(
-            f"'{arg}' is not in the official plugin registry. "
-            f"Available: {available}. Or install by URL/path."
-        )
-    entry = registry[arg]
-    # Registry entries may be either a plain URL string, or an object
-    # {"url": ..., "subpath": ...} for monorepo plugin collections.
-    if isinstance(entry, dict):
-        url = entry.get("url", "")
-        subpath = entry.get("subpath") or subpath
-        if not url:
-            raise InstallError(f"registry entry for '{arg}' has no 'url' field")
-    else:
-        url = str(entry)
-    dest = plugins_dir / arg
-    _clone(url, dest, subpath=subpath, ref=ref)
-    meta = _read_plugin_meta(dest)
-    if not no_deps:
-        _install_dependencies(meta.get("dependencies", []))
-        installed_deps = meta.get("dependencies", [])
-    _write_install_manifest(dest, name=arg, source="registry", url=url,
-                            subpath=subpath, ref=ref, meta=meta)
-    return InstallResult(name=arg, path=dest, source="registry",
-                         version=meta.get("version"), dependencies_installed=installed_deps)
 
 
 def uninstall(name: str, plugins_dir: Path | None = None) -> Path:
@@ -376,9 +388,9 @@ def uninstall(name: str, plugins_dir: Path | None = None) -> Path:
 # Browse / search the official registry
 # ---------------------------------------------------------------------------
 
-def _registry_entries() -> list[dict]:
+def _registry_entries(registry_url: str | None = None) -> list[dict]:
     """Return registry entries as normalized dicts (drop _comment etc.)."""
-    raw = _fetch_registry()
+    raw = _fetch_registry(registry_url)
     out = []
     for name, entry in raw.items():
         if name.startswith("_"):
@@ -391,24 +403,24 @@ def _registry_entries() -> list[dict]:
     return out
 
 
-def list_available() -> list[dict]:
-    """List all plugins in the official registry with their metadata.
+def list_available(registry_url: str | None = None, plugins_dir: Path | None = None) -> list[dict]:
+    """List all plugins in the registry with their metadata.
 
-    Each entry: {name, url, subpath?, description?, tags?, installed?}.
-    `installed` is True if a plugin of that name exists locally.
+    Each entry: {name, url, subpath?, description?, tags?, installed?}; ``name``
+    is the plugin id. `installed` is True if that plugin id exists locally.
     """
-    plugins_dir = get_plugins_dir()
-    entries = _registry_entries()
+    plugins_dir = plugins_dir or get_plugins_dir()
+    entries = _registry_entries(registry_url)
     for e in entries:
         e["installed"] = (plugins_dir / e["name"]).exists()
     return entries
 
 
-def search_available(query: str) -> list[dict]:
+def search_available(query: str, registry_url: str | None = None) -> list[dict]:
     """Search the registry by name/description/tags (case-insensitive substring)."""
     q = query.lower()
     results = []
-    for e in list_available():
+    for e in list_available(registry_url):
         haystack = " ".join([
             e.get("name", ""),
             e.get("description", ""),
@@ -423,35 +435,23 @@ def search_available(query: str) -> list[dict]:
 # Updates
 # ---------------------------------------------------------------------------
 
-REMOTE_META_TIMEOUT = 15
-
-
 def _fetch_remote_meta(url: str, subpath: str | None, ref: str | None) -> dict:
-    """Clone a repo (shallow, optional ref) to a temp dir and read the subdir's pyproject.toml.
-
-    Used to learn the latest version of a plugin without installing it.
-    """
-    import tempfile
-
-    if not _git_available():
-        return {}
+    """Read remote plugin metadata and the commit it belongs to."""
+    try:
+        if github_repository(url):
+            commit = resolve_github_commit(url, ref)
+            path = f"{subpath.rstrip('/')}/pyproject.toml" if subpath else "pyproject.toml"
+            content = read_github_file(url, path, commit=commit)
+            return {**_parse_plugin_meta(content.decode("utf-8")), "resolved_commit": commit}
+    except (SourceError, UnicodeDecodeError) as exc:
+        raise InstallError(str(exc)) from exc
+    if not _is_url(url):
+        local = Path(url)
+        return _read_plugin_meta(local / subpath if subpath else local)
     with tempfile.TemporaryDirectory() as tmp:
         tmp_repo = Path(tmp) / "repo"
-        cmd = ["git", "clone", "--depth", "1"]
-        if ref:
-            cmd += ["--branch", ref]
-        cmd += [url, str(tmp_repo)]
-        try:
-            subprocess.run(  # noqa: S603, S607
-                cmd, check=True, capture_output=True, text=True, timeout=REMOTE_META_TIMEOUT,
-            )
-        except Exception:
-            return {}
-        target = tmp_repo / subpath if subpath else tmp_repo
-        pp = target / "pyproject.toml"
-        if not pp.exists():
-            return {}
-        return _read_plugin_meta(target)
+        source_meta = _clone(url, tmp_repo, subpath=subpath, ref=ref)
+        return {**_read_plugin_meta(tmp_repo), **source_meta}
 
 
 def list_installed(plugins_dir: Path | None = None) -> list[dict]:
@@ -471,6 +471,8 @@ def list_installed(plugins_dir: Path | None = None) -> list[dict]:
             "url": manifest.get("url"),
             "subpath": manifest.get("subpath"),
             "ref": manifest.get("ref"),
+            "resolved_commit": manifest.get("resolved_commit"),
+            "registry_url": manifest.get("registry_url"),
             "installed_at": manifest.get("installed_at"),
         })
     return out
@@ -479,7 +481,8 @@ def list_installed(plugins_dir: Path | None = None) -> list[dict]:
 def check_update(name: str, plugins_dir: Path | None = None) -> dict:
     """Check if an installed plugin has a newer version available.
 
-    Returns {name, local_version, remote_version, up_to_date}.
+    Returns versions, commits, content_changed, and up_to_date. A changed
+    commit is an update even when the plugin version is unchanged.
     Works for both registry and url/path-installed plugins: reads the local
     .pymss-install.json for the source url/subpath, fetches remote meta.
     """
@@ -491,6 +494,7 @@ def check_update(name: str, plugins_dir: Path | None = None) -> dict:
     url = manifest.get("url")
     subpath = manifest.get("subpath")
     local_version = manifest.get("version")
+    local_commit = manifest.get("resolved_commit")
     if not url:
         raise InstallError(
             f"plugin '{name}' has no url in its install manifest; cannot check for updates"
@@ -499,18 +503,24 @@ def check_update(name: str, plugins_dir: Path | None = None) -> dict:
     # releases even when the plugin was installed at a pinned ref.
     remote_meta = _fetch_remote_meta(url, subpath, ref=None)
     remote_version = remote_meta.get("version")
+    remote_commit = remote_meta.get("resolved_commit")
+    content_changed = remote_commit is not None and local_commit != remote_commit
     return {
         "name": name,
         "local_version": local_version,
         "remote_version": remote_version,
-        "up_to_date": (remote_version is None) or (local_version == remote_version),
+        "local_commit": local_commit,
+        "remote_commit": remote_commit,
+        "content_changed": content_changed,
+        "up_to_date": remote_version is not None and local_version == remote_version and not content_changed,
     }
 
 
 def update(name: str, plugins_dir: Path | None = None) -> InstallResult:
     """Reinstall a plugin at its latest version. Returns the new InstallResult.
 
-    Ignores any pinned ref so the latest default-branch version is pulled.
+    Uses the recorded source and prepares the new plugin before replacing
+    the installed directory. Ignores any pinned ref.
     """
     plugins_dir = plugins_dir or get_plugins_dir()
     dest = plugins_dir / name
@@ -524,13 +534,29 @@ def update(name: str, plugins_dir: Path | None = None) -> InstallResult:
         raise InstallError(
             f"plugin '{name}' has no url in its install manifest; cannot update"
         )
-    # Reinstall via the original source, pulling the latest (ref=None).
-    uninstall(name, plugins_dir=plugins_dir)
-    if source == "path":
-        return install(url, plugins_dir=plugins_dir, subpath=subpath)
-    if source == "registry":
-        return install(name, plugins_dir=plugins_dir, subpath=subpath)
-    return install(url, plugins_dir=plugins_dir, subpath=subpath)
+    registry_url = manifest.get("registry_url")
+    if source == "registry" and not registry_url:
+        raise InstallError(f"plugin '{name}' has no registry URL in its install manifest")
+    with tempfile.TemporaryDirectory(prefix=".update-", dir=plugins_dir) as temporary:
+        candidate = install(
+            name if source == "registry" else url,
+            plugins_dir=Path(temporary), subpath=subpath, registry_url=registry_url,
+        )
+        if candidate.name != name:
+            raise InstallError(f"update for '{name}' contains plugin '{candidate.name}'")
+        backup = plugins_dir / f".previous-{name}-{uuid4().hex}"
+        dest.rename(backup)
+        try:
+            candidate.path.rename(dest)
+        except BaseException:
+            backup.rename(dest)
+            raise
+        candidate.path = dest
+        try:
+            shutil.rmtree(backup)
+        except OSError:
+            logger.warning("Updated plugin %s; could not remove previous directory %s", name, backup, exc_info=True)
+        return candidate
 
 
 __all__ = [

@@ -239,7 +239,7 @@ pymss plugins dir            # print the plugins directory
 
 `update` works identically for **official and third-party (URL/path-installed) plugins** — pymss records each install's provenance, so you only ever refer to a plugin by its folder name.
 
-Plugins live in `~/.pymss/plugins/` (override with `PYMSS_PLUGINS_DIR`). A single plugin failing to load never blocks others. The official plugin registry is a separate `pymss-plugins` repo (a `registry.json` mapping short names to sources) — point `pymss install <name>` at a custom one via `PYMSS_PLUGINS_REGISTRY`.
+Plugins live in `~/.pymss/plugins/` (override with `PYMSS_PLUGINS_DIR`) and need a v2 manifest (see `docs/plugin-protocol.md`). A single plugin failing to load never blocks others. The official plugin registry is a separate `pymss-plugins` repo (a `registry.json` keyed by plugin id) — point `pymss install <id>` at a custom one via `PYMSS_PLUGINS_REGISTRY`.
 
 **Write a plugin** — a standard `pyproject.toml` with `[project].name`/`version`/`dependencies` is all pymss needs (no pymss-specific fields). Register a capability and pymss makes it available to the Python API, the CLI, and workflow nodes:
 

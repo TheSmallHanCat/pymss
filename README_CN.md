@@ -231,7 +231,7 @@ pymss plugins dir            # 打印插件目录
 
 `update` 对**官方插件和第三方（URL/路径装的）插件完全一样**——pymss 会记录每次安装的来源，所以更新时只需用插件文件夹名。
 
-插件放在 `~/.pymss/plugins/`（可用 `PYMSS_PLUGINS_DIR` 覆盖）。单个插件加载失败不会影响其他插件。官方插件目录是一个独立的 `pymss-plugins` 仓库（里面的 `registry.json` 映射短名到来源）；可通过 `PYMSS_PLUGINS_REGISTRY` 指向自定义目录。
+插件放在 `~/.pymss/plugins/`（可用 `PYMSS_PLUGINS_DIR` 覆盖）。单个插件加载失败不会影响其他插件。官方插件目录是一个独立的 `pymss-plugins` 仓库（里面的 `registry.json` 以插件 id 为键）；插件需要 v2 清单，见 `docs/plugin-protocol.md`；可通过 `PYMSS_PLUGINS_REGISTRY` 指向自定义目录。
 
 **编写插件** —— 只需标准的 `pyproject.toml`（带 `[project].name`/`version`/`dependencies`），无需任何 pymss 专属字段。注册一个能力，pymss 会让它对 Python API、CLI 和工作流节点都可用：
 

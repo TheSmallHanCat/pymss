@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from .loader import (
     DEFAULT_PLUGINS_DIR,
-    ENTRYPOINT_GROUP,
     PluginLoadReport,
     PluginLoadResult,
     bootstrap,
@@ -37,8 +36,9 @@ from .registry import (
     register_node,
     require_capability,
 )
-from .manifest import API_VERSION, ManifestError, PluginManifest, read_manifest
+from .manifest import API_VERSION, ManifestError, OperationDecl, PluginManifest, read_manifest
 from .lifecycle import PluginManager, PluginState, satisfies
+from . import kit
 
 __all__ = [
     # registration API (plugin authors)
@@ -58,13 +58,15 @@ __all__ = [
     "PluginLoadReport",
     "PluginLoadResult",
     "DEFAULT_PLUGINS_DIR",
-    "ENTRYPOINT_GROUP",
-    # plugin protocol v1 (docs/plugin-protocol.md)
+    # plugin protocol v2 (docs/plugin-protocol.md)
     "ManifestError",
+    "OperationDecl",
     "PluginManifest",
     "PluginManager",
     "PluginState",
     "read_manifest",
     "satisfies",
     "API_VERSION",
+    # plugin author helpers
+    "kit",
 ]

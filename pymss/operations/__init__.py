@@ -18,9 +18,14 @@ Design (round 2 of the plugin redesign, docs/plugin-redesign-plan.md):
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
+
+from .._identifiers import OPERATION_ID_RE
+
+if TYPE_CHECKING:
+    from ..plugins.lifecycle import PluginState
 
 __all__ = [
     "OperationError",
@@ -32,8 +37,6 @@ __all__ = [
 ]
 
 AUDIO_TYPE = "audio"
-
-_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){1,}$")
 
 _SUPPORTED_PARAM_TYPES = {"object", "number", "integer", "string", "boolean"}
 
@@ -61,7 +64,7 @@ class OperationSpec:
     description: str = ""
 
     def __post_init__(self) -> None:
-        if not isinstance(self.id, str) or not _ID_PATTERN.match(self.id):
+        if not isinstance(self.id, str) or not OPERATION_ID_RE.fullmatch(self.id):
             raise OperationError(
                 f"operation id must be a dot-namespaced lowercase identifier, got {self.id!r}"
             )
@@ -159,13 +162,14 @@ class OperationContext:
     """
 
     workdir: str | None = None
-    progress: Callable[[float, str], None] | None = None
+    progress: Callable[[float, str, dict[str, Any] | None], None] | None = None
     cancelled: Callable[[], bool] | None = None
     logger: Any = None
 
-    def report_progress(self, fraction: float, message: str = "") -> None:
+    def report_progress(self, fraction: float, message: str = "", *, event: Mapping[str, Any] | None = None) -> None:
+        """Report progress; ``event`` carries optional structured host data (``{"type", "payload"}``)."""
         if self.progress is not None:
-            self.progress(fraction, message)
+            self.progress(fraction, message, dict(event) if event is not None else None)
 
     def check_cancelled(self) -> None:
         if self.cancelled is not None and self.cancelled():
@@ -184,14 +188,13 @@ class Runtime:
     """Isolated operation registry + executor.
 
     Not shared across processes or hosts; each host (CLI, Studio worker,
-    Comfy) creates its own instance. The legacy global plugin registry is not
-    consulted unless ``load_plugins`` discovers old-style plugins, in which
-    case their capabilities/nodes stay in the global registry as before.
+    Comfy) creates its own instance. Capabilities/nodes/CLI commands that a
+    plugin registers from ``setup()`` still land in the global registry.
     """
 
     _operations: dict[str, _OperationEntry] = field(default_factory=dict)
     _load_report: list[dict[str, Any]] = field(default_factory=list)
-    _manifest_plugin_dirs: dict[str, str] = field(default_factory=dict)
+    _active_plugins: dict[str, PluginState] = field(default_factory=dict)
 
     # ---- registration ----
 
@@ -250,128 +253,41 @@ class Runtime:
 
     # ---- plugin loading (setup protocol) ----
 
-    def load_plugins(self) -> list[dict[str, Any]]:
-        """Scan the plugins dir; each plugin's setup() registers into *this* runtime.
+    def load_plugins(
+        self, roots: Sequence[str | Path] | None = None,
+        *, validate_plugin: Callable[[Path], None] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Load v2 manifest plugins from ``roots``; each setup() registers into *this* runtime.
 
-        Registrations made by a plugin whose setup() raises are rolled back,
-        and the failure recorded in the report.
-
-        Protocol v1 (docs/plugin-protocol.md): plugins with a
-        ``[tool.pymss.plugin]`` manifest go through the PluginManager
-        (dependency resolution, ordered activation, blocked diagnostics).
-        Manifest-less plugins keep the legacy scan below.
+        ``roots`` defaults to ``get_plugins_dir()``. Plugins go through the
+        PluginManager (dependency resolution, ordered activation, blocked
+        diagnostics). Registrations made by a plugin whose setup() raises, or
+        whose operations differ from its manifest, are rolled back and the
+        failure is recorded in the report (docs/plugin-protocol.md). Already
+        activated plugins satisfy dependencies across calls and are not
+        initialized again; replacing their code requires a new Runtime.
+        A host may validate each newly discovered package before resolution;
+        a validation error blocks the package and its dependent plugins before
+        any of their Python code is imported.
         """
-        import os
-        from pathlib import Path
+        from ..plugins.lifecycle import PluginManager, pymss_package_version
+        from ..plugins.loader import get_plugins_dir
 
-        self._load_report = []
-        plugins_dir = os.environ.get("PYMSS_PLUGINS_DIR")
-        if not plugins_dir:
-            plugins_dir = str(Path.home() / ".pymss" / "plugins")
-        root = Path(plugins_dir)
-        if not root.exists():
-            return self._load_report
-        import importlib.util
-        import sys
-
-        # ---- protocol v1: manifest plugins (resolve → ordered activate) ----
-        manifest_rows: dict[str, dict[str, Any]] = {}
-        try:
-            from ..plugins.lifecycle import PluginManager, pymss_package_version
-
-            manager = PluginManager(root)
-            states = manager.discover()
+        directories = [Path(root) for root in roots] if roots is not None else [get_plugins_dir()]
+        manager = PluginManager(directories, active_plugins=self._active_plugins)
+        states = manager.discover()
+        if validate_plugin is not None:
             for state in states:
-                if state.manifest is None:
-                    continue
-                plugin_id = state.manifest.plugin_id
-                previous = self._manifest_plugin_dirs.get(plugin_id)
-                if previous is not None and previous != str(state.directory.resolve()):
-                    state.status = "blocked"
-                    state.error = f"duplicate plugin id {plugin_id!r}: already activated from {previous}"
-            manager.resolve(pymss_version=pymss_package_version())
-            rows = manager.activate(lambda source: _RuntimePluginHandle(self, source=source))
-            for row in rows:
-                name = row.get("name")
-                if isinstance(name, str):
-                    manifest_rows[name] = row
-                    if row.get("loaded"):
-                        self._manifest_plugin_dirs[row["plugin_id"]] = str((root / name).resolve())
-        except Exception as exc:  # noqa: BLE001 — lifecycle must not break legacy loading
-            self._load_report.append(
-                {"name": "<plugin-lifecycle>", "loaded": False, "error": f"{type(exc).__name__}: {exc}"}
-            )
-
-        for child in sorted(root.iterdir()):
-            if not child.is_dir() or child.name.startswith(("_", ".")):
-                continue
-            entry_file = next(
-                (child / name for name in ("__init__.py", "plugin.py") if (child / name).exists()),
-                None,
-            )
-            pyproject = child / "pyproject.toml"
-            if entry_file is None:
-                if pyproject.exists() and child.name in manifest_rows:
-                    self._load_report.append(manifest_rows[child.name])
-                elif pyproject.exists():
-                    # Broken manifest (blocked at discovery) or manifest without entry file.
-                    from ..plugins.manifest import ManifestError, read_manifest
-
+                if state.status == "discovered" and state.manifest is not None:
                     try:
-                        read_manifest(child)
-                        self._load_report.append({"name": child.name, "loaded": False, "error": "no entry file"})
-                    except ManifestError as exc:
-                        self._load_report.append({"name": child.name, "loaded": False, "error": str(exc)})
-                else:
-                    self._load_report.append(
-                        {"name": child.name, "loaded": False, "error": "no entry file"}
-                    )
-                continue
-            if child.name in manifest_rows:
-                # Manifest plugin already handled by the lifecycle manager.
-                row = manifest_rows[child.name]
-                if row.get("loaded"):
-                    registered = sorted(
-                        op_id for op_id, entry in self._operations.items()
-                        if entry.source == f"plugin:{row.get('plugin_id')}"
-                    )
-                    row["operations"] = registered
-                self._load_report.append(row)
-                continue
-            modname = f"_pymss_runtime_plugin_{child.name}"
-            before = set(self._operations)
-            handle = _RuntimePluginHandle(self, source=modname)
-            try:
-                spec = importlib.util.spec_from_file_location(modname, entry_file)
-                module = importlib.util.module_from_spec(spec)
-                sys.modules[modname] = module
-                try:
-                    spec.loader.exec_module(module)
-                    setup = getattr(module, "setup", None)
-                    if setup is not None:
-                        setup(handle)
-                except Exception:
-                    sys.modules.pop(modname, None)
-                    raise
-            except Exception as exc:  # noqa: BLE001
-                handle.rollback()
-                self._load_report.append(
-                    {
-                        "name": child.name,
-                        "loaded": False,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
-            else:
-                self._load_report.append(
-                    {
-                        "name": child.name,
-                        "loaded": True,
-                        "legacy": True,
-                        "api_version": 0,
-                        "operations": sorted(set(self._operations) - before),
-                    }
-                )
+                        validate_plugin(state.directory)
+                    except Exception as error:
+                        state.status, state.error = "blocked", str(error)
+        manager.resolve(pymss_version=pymss_package_version())
+        self._load_report = manager.activate(lambda source: _RuntimePluginHandle(self, source=source))
+        for state in states:
+            if state.status == "activated" and state.manifest is not None:
+                self._active_plugins[state.manifest.plugin_id] = state
         return self._load_report
 
     def plugin_report(self) -> list[dict[str, Any]]:
@@ -395,6 +311,7 @@ class _RuntimePluginHandle:
         self._capabilities_before = dict(registry.capabilities)
         self._nodes_before = dict(registry.nodes)
         self._cli_before = list(registry.cli_commands)
+        self.registered_operations: list[str] = []
 
     def register_operation(self, *, id, params, inputs=None, outputs=None, run=None, **kwargs):
         spec = OperationSpec(
@@ -409,6 +326,7 @@ class _RuntimePluginHandle:
         if run is None:
             raise OperationError(f"operation {id!r} requires a run handler")
         self.runtime.register(spec=spec, run=run, source=self.source)
+        self.registered_operations.append(id)
 
     def rollback(self) -> None:
         """Restore registrations made or replaced during this plugin's activation."""

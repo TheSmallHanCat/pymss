@@ -1,13 +1,11 @@
 """Plugin manifest parsing for the pymss plugin protocol (docs/plugin-protocol.md).
 
 Reads ``[tool.pymss.plugin]`` from a plugin's pyproject.toml. Discovery only —
-no plugin code is executed here. Manifest-less directories remain legacy
-plugins with unchanged behaviour.
+no plugin code is executed here. Every plugin must declare a v2 manifest;
+host-specific tables such as ``[tool.pymss.studio]`` are ignored.
 """
 
 from __future__ import annotations
-
-import re
 
 import re
 import tomllib
@@ -15,13 +13,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-PLUGIN_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]*\Z")
+from .._identifiers import OPERATION_ID_RE, PLUGIN_ID_RE
+
 _SINGLE_CONSTRAINT = r"(==|>=|<=|>|<|~)?\s*[0-9][0-9A-Za-z.\-+]*\s*"
 VERSION_CONSTRAINT_RE = re.compile(rf"^\s*{_SINGLE_CONSTRAINT}(,\s*{_SINGLE_CONSTRAINT})*$")
-API_VERSION = 1
-SUPPORTED_PLACEMENTS = {"tool", "workspace"}
-SUPPORTED_PLAYER_SCOPES = {"clip", "track"}
-SUPPORTED_PLAYER_MODES = {"rendered_preview", "offline_export"}
+API_VERSION = 2
+MIGRATION_HINT = "see docs/plugin-protocol.md#migrating-from-v1"
 
 
 class ManifestError(ValueError):
@@ -60,20 +57,11 @@ class NodeContribution:
 
 
 @dataclass
-class ViewContribution:
+class OperationDecl:
+    """An operation the plugin promises to register from ``setup()``."""
+
     id: str
     title: str
-    entry: Path
-    placements: tuple[str, ...]
-    operation: str | None
-    permissions: tuple[str, ...]
-
-
-@dataclass
-class PlayerContribution:
-    operation: str
-    scopes: tuple[str, ...]
-    modes: tuple[str, ...]
 
 
 @dataclass
@@ -86,11 +74,13 @@ class PluginManifest:
     requires_pymss: str | None
     version: str | None
     dependencies: dict[str, str] = field(default_factory=dict)
+    operations: list[OperationDecl] = field(default_factory=list)
     graphs: list[GraphContribution] = field(default_factory=list)
     nodes: list[NodeContribution] = field(default_factory=list)
-    views: list[ViewContribution] = field(default_factory=list)
-    player: list[PlayerContribution] = field(default_factory=list)
-    legacy: bool = False
+
+    @property
+    def operation_ids(self) -> set[str]:
+        return {operation.id for operation in self.operations}
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -99,6 +89,7 @@ class PluginManifest:
             "api_version": self.api_version,
             "requires_pymss": self.requires_pymss,
             "dependencies": dict(self.dependencies),
+            "operations": [{"id": o.id, "title": o.title} for o in self.operations],
             "contributions": {
                 "graphs": [{"id": g.id, "file": g.file.name, "operation": g.operation} for g in self.graphs],
                 "nodes": [
@@ -108,18 +99,6 @@ class PluginManifest:
                         "widgets": [dict(w) for w in n.widgets], "description": n.description,
                     }
                     for n in self.nodes
-                ],
-                "views": [
-                    {
-                        "id": v.id, "title": v.title, "entry": str(v.entry),
-                        "placements": list(v.placements), "operation": v.operation,
-                        "permissions": list(v.permissions),
-                    }
-                    for v in self.views
-                ],
-                "player": [
-                    {"operation": p.operation, "scopes": list(p.scopes), "modes": list(p.modes)}
-                    for p in self.player
                 ],
             },
         }
@@ -249,88 +228,49 @@ def _parse_nodes(contributions: Any) -> list[NodeContribution]:
     return nodes
 
 
-def _parse_views(plugin_dir: Path, contributions: Any) -> list[ViewContribution]:
-    items = contributions.get("views", [])
+def _parse_operations(plugin_id: str, items: Any) -> list[OperationDecl]:
     if not isinstance(items, list):
-        raise ManifestError("contributions.views must be an array of tables")
-    views: list[ViewContribution] = []
+        raise ManifestError("operations must be an array of tables")
+    operations: list[OperationDecl] = []
     seen: set[str] = set()
     for item in items:
         if not isinstance(item, dict):
-            raise ManifestError("each views entry must be a table")
-        view_id = str(item.get("id") or "").strip()
-        if not PLUGIN_ID_RE.fullmatch(view_id):
-            raise ManifestError(f"views entry id {item.get('id')!r} is invalid")
-        if view_id in seen:
-            raise ManifestError(f"duplicate views id {view_id!r}")
-        seen.add(view_id)
-        placements_raw = item.get("placements", ["tool"])
-        if not isinstance(placements_raw, list) or not placements_raw:
-            raise ManifestError(f"views[{view_id}].placements must be a non-empty array")
-        placements = tuple(str(p) for p in placements_raw)
-        unknown = [p for p in placements if p not in SUPPORTED_PLACEMENTS]
-        if unknown:
-            raise ManifestError(f"views[{view_id}].placements has unsupported values {unknown}")
-        permissions_raw = item.get("permissions", ["operations"])
-        if not isinstance(permissions_raw, list):
-            raise ManifestError(f"views[{view_id}].permissions must be an array")
-        views.append(ViewContribution(
-            id=view_id,
-            title=str(item.get("title") or view_id),
-            entry=_resolve_inside(plugin_dir, item.get("entry"), f"views[{view_id}].entry", must_exist=True),
-            placements=placements,
-            operation=(str(item["operation"]).strip() or None) if item.get("operation") else None,
-            permissions=tuple(str(p) for p in permissions_raw),
-        ))
-    return views
+            raise ManifestError("each operations entry must be a table")
+        operation_id = str(item.get("id") or "").strip()
+        if not OPERATION_ID_RE.fullmatch(operation_id):
+            raise ManifestError(f"operation id {item.get('id')!r} must be a dot-namespaced lowercase identifier")
+        if not operation_id.startswith(plugin_id + "."):
+            raise ManifestError(f"operation id {item.get('id')!r} must start with {plugin_id + '.'!r}")
+        if operation_id in seen:
+            raise ManifestError(f"duplicate operation id {operation_id!r}")
+        seen.add(operation_id)
+        operations.append(OperationDecl(id=operation_id, title=str(item.get("title") or operation_id)))
+    return operations
 
 
-def _parse_player(contributions: Any) -> list[PlayerContribution]:
-    items = contributions.get("player", [])
-    if not isinstance(items, list):
-        raise ManifestError("contributions.player must be an array of tables")
-    entries: list[PlayerContribution] = []
-    for item in items:
-        if not isinstance(item, dict):
-            raise ManifestError("each player entry must be a table")
-        operation = str(item.get("operation") or "").strip()
-        if not operation:
-            raise ManifestError("player entry must reference an operation")
-        scopes_raw = item.get("scopes", ["clip", "track"])
-        modes_raw = item.get("modes", ["rendered_preview", "offline_export"])
-        scopes = tuple(str(s) for s in scopes_raw) if isinstance(scopes_raw, list) else ()
-        modes = tuple(str(m) for m in modes_raw) if isinstance(modes_raw, list) else ()
-        if not scopes or any(s not in SUPPORTED_PLAYER_SCOPES for s in scopes):
-            raise ManifestError(f"player entry for {operation!r} has invalid scopes")
-        if not modes or any(m not in SUPPORTED_PLAYER_MODES for m in modes):
-            raise ManifestError(f"player entry for {operation!r} has invalid modes")
-        entries.append(PlayerContribution(operation=operation, scopes=scopes, modes=modes))
-    return entries
+def read_manifest(plugin_dir: Path) -> PluginManifest:
+    """Parse and validate the plugin manifest.
 
-
-def read_manifest(plugin_dir: Path) -> PluginManifest | None:
-    """Parse the plugin manifest. Returns None for legacy (manifest-less) plugins.
-
-    Raises ManifestError for malformed manifests — a broken manifest blocks the
-    plugin at load time instead of failing later during import.
+    Raises ManifestError for missing or malformed manifests — a broken manifest
+    blocks the plugin at load time instead of failing later during import.
     """
     pyproject = plugin_dir / "pyproject.toml"
     if not pyproject.is_file():
-        return None
+        raise ManifestError(f"missing pyproject.toml with [tool.pymss.plugin]; {MIGRATION_HINT}")
     try:
         data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
     except (tomllib.TOMLDecodeError, OSError) as exc:
         raise ManifestError(f"cannot read pyproject.toml: {exc}") from exc
     section = data.get("tool", {}).get("pymss", {}).get("plugin")
     if not isinstance(section, dict) or not section:
-        return None
+        raise ManifestError(f"missing [tool.pymss.plugin]; {MIGRATION_HINT}")
 
     plugin_id = str(section.get("id") or "").strip()
     if not PLUGIN_ID_RE.fullmatch(plugin_id):
         raise ManifestError(f"plugin id {section.get('id')!r} must be lowercase dot/dash/underscore identifiers")
-    api_version = section.get("api_version", API_VERSION)
-    if not isinstance(api_version, int) or api_version < 1:
-        raise ManifestError(f"api_version must be a positive integer, got {api_version!r}")
+    api_version = section.get("api_version")
+    if api_version != API_VERSION or isinstance(api_version, bool):
+        raise ManifestError(f"api_version must be {API_VERSION}, got {api_version!r}; {MIGRATION_HINT}")
 
     dependencies: dict[str, str] = {}
     raw_deps = section.get("dependencies", {})
@@ -359,16 +299,15 @@ def read_manifest(plugin_dir: Path) -> PluginManifest | None:
         if section.get("requires_pymss") else None,
         version=str(project.get("version")) if isinstance(project, dict) and project.get("version") else None,
         dependencies=dependencies,
+        operations=_parse_operations(plugin_id, section.get("operations", [])),
         graphs=_parse_graphs(plugin_dir, contributions),
         nodes=_parse_nodes(contributions),
-        views=_parse_views(plugin_dir, contributions),
-        player=_parse_player(contributions),
     )
 
 
-def parse_entry_point(entry: str | None, plugin_dir: Path) -> tuple[str, str]:
-    """Resolve the manifest entry to (module, attr). Defaults to the directory name."""
+def parse_entry_point(entry: str | None) -> tuple[str, str]:
+    """Resolve the manifest entry to (module, attr). Defaults to ``__init__:setup``."""
     if entry:
         module, _, attr = entry.partition(":")
         return module.strip(), (attr.strip() or "setup")
-    return plugin_dir.name, "setup"
+    return "__init__", "setup"
