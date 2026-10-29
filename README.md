@@ -5,6 +5,8 @@ Python package for music source separation. <br>
 
 ## Install
 
+pymss 2.2 and later requires Python 3.11 or newer.
+
 If you want the CUDA build of PyTorch, install it first:
 
 ```sh
@@ -58,7 +60,7 @@ pip install "pymss[server]"
 
 ## Develop
 
-Development requires Git, Python 3.10 or later, and [uv](https://docs.astral.sh/uv/). WebUI development also requires Node.js and npm.
+Development requires Git, Python 3.11 or later, and [uv](https://docs.astral.sh/uv/). WebUI development also requires Node.js and npm.
 
 Clone the Python package repository and install development dependencies:
 

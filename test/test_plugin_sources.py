@@ -104,10 +104,16 @@ def test_install_github_archive_without_git_records_commit(tmp_path, monkeypatch
 
 @pytest.mark.parametrize("filename", [
     "repository/../escape.py", "/absolute.py", "repository/C:/file.py", "repository/dir\\file.py",
+    "repository/file\x00.py",
 ])
 def test_archive_rejects_unsafe_paths_before_writing(tmp_path, filename):
     archive = tmp_path / "repository.zip"
-    archive.write_bytes(_archive([(filename, b"unsafe")]))
+    entry = zipfile.ZipInfo(filename)
+    # Preserve malformed names instead of normalizing them while building the ZIP.
+    entry.filename = filename
+    archive.write_bytes(_archive([(entry, b"unsafe")]))
+    with zipfile.ZipFile(archive) as source:
+        assert source.infolist()[0].orig_filename == filename
     destination = tmp_path / "plugin"
     with pytest.raises(sources.SourceError, match="Unsafe repository path"):
         sources._extract_archive(archive, destination, None)

@@ -491,6 +491,128 @@ def test_read_plugin_meta_no_pyproject(tmp_path):
     assert _read_plugin_meta(d) == {}
 
 
+@pytest.fixture
+def marked_dependencies():
+    return [
+        "numpy",
+        "funasr-mlx>=0.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
+        "funasr>=1.2; sys_platform != 'darwin' or platform_machine != 'arm64'",
+        "torch>=2.1; sys_platform != 'darwin' or platform_machine != 'arm64'",
+        "torchaudio>=2.1; sys_platform != 'darwin' or platform_machine != 'arm64'",
+        'requests[socks]>=2.32; python_version >= "3.11"',
+    ]
+
+
+def test_parse_plugin_meta_preserves_markers_and_extras(marked_dependencies):
+    from pymss.plugins.install import _parse_plugin_meta
+
+    text = '[project]\nname = "pymss-plugin-asr"\nversion = "0.3.0"\n'
+    text += 'dependencies = ' + json.dumps(marked_dependencies) + '\n'
+    assert _parse_plugin_meta(text) == {
+        "name": "pymss-plugin-asr", "version": "0.3.0", "dependencies": marked_dependencies,
+    }
+
+
+def test_parse_plugin_meta_uses_only_project_fields():
+    from pymss.plugins.install import _parse_plugin_meta
+
+    text = '''
+[tool.build]
+name = "unrelated"
+version = "9.0.0"
+dependencies = ["tool-only"]
+[project]
+name = "pymss-plugin-audio"
+version = "1.2.3"
+dependencies = [
+    "numpy", # "comment-only"
+]
+[project.optional-dependencies]
+server = ["extra-only"]
+[dependency-groups]
+dev = ["dev-only"]
+'''
+    assert _parse_plugin_meta(text) == {
+        "name": "pymss-plugin-audio", "version": "1.2.3", "dependencies": ["numpy"],
+    }
+
+
+def test_parse_plugin_meta_keeps_missing_fields_absent():
+    from pymss.plugins.install import _parse_plugin_meta
+
+    assert _parse_plugin_meta('[tool.build]\ndependencies = ["tool-only"]\n') == {}
+    assert _parse_plugin_meta('[project]\nname = "audio"\n[project.optional-dependencies]\nserver = ["extra-only"]\n') == {
+        "name": "audio",
+    }
+    assert _parse_plugin_meta('[project]\nname = 12\nversion = true\n') == {}
+
+
+def test_parse_plugin_meta_filters_only_bare_pymss():
+    from pymss.plugins.install import _parse_plugin_meta
+
+    retained = ["pymss>=2.2", "pymss[server]>=2.2", " pymss "]
+    text = '[project]\ndependencies = ' + json.dumps(["pymss", "PyMSS", *retained])
+    assert _parse_plugin_meta(text)["dependencies"] == retained
+
+
+@pytest.mark.parametrize(("text", "message"), [
+    ("[project", "invalid pyproject.toml"),
+    ("project = []", "project must be a TOML table"),
+    ('[project]\ndependencies = "numpy"', "project.dependencies must be a list of strings"),
+    ('[project]\ndependencies = ["numpy", 1]', "project.dependencies must be a list of strings"),
+    ('[project]\ndependencies = {numpy = "*"}', "project.dependencies must be a list of strings"),
+])
+def test_parse_plugin_meta_rejects_invalid_metadata(text, message):
+    from pymss.plugins.install import _parse_plugin_meta
+
+    with pytest.raises(InstallError, match=message):
+        _parse_plugin_meta(text)
+
+
+def test_read_plugin_meta_reports_invalid_utf8(tmp_path):
+    from pymss.plugins.install import _read_plugin_meta
+
+    (tmp_path / "pyproject.toml").write_bytes(b"\xff\xfe")
+    with pytest.raises(InstallError, match="cannot read pyproject.toml"):
+        _read_plugin_meta(tmp_path)
+
+
+@pytest.mark.parametrize("no_deps", [False, True])
+def test_install_preserves_marked_dependencies(tmp_path, monkeypatch, marked_dependencies, no_deps):
+    from pymss.plugins import install as install_mod
+
+    source = _write_plugin(tmp_path / "source", "author.marked")
+    text = _manifest("author.marked").replace('[project]\n', '[project]\ndependencies = ' + json.dumps(marked_dependencies) + '\n')
+    (source / "pyproject.toml").write_text(text, encoding="utf-8")
+    dependencies = Mock()
+    monkeypatch.setattr(install_mod, "_install_dependencies", dependencies)
+    installed = tmp_path / "installed"
+    result = install_mod.install(str(source), plugins_dir=installed, no_deps=no_deps)
+    if no_deps:
+        dependencies.assert_not_called()
+        assert result.dependencies_installed == []
+    else:
+        dependencies.assert_called_once_with(marked_dependencies)
+        assert result.dependencies_installed == marked_dependencies
+    assert result.path == installed / "author.marked"
+    assert list(installed.iterdir()) == [result.path]
+
+
+def test_install_rejects_invalid_dependencies_before_installing(tmp_path, monkeypatch):
+    from pymss.plugins import install as install_mod
+
+    source = _write_plugin(tmp_path / "source", "author.invalid")
+    text = _manifest("author.invalid").replace('[project]\n', '[project]\ndependencies = ["numpy", 1]\n')
+    (source / "pyproject.toml").write_text(text, encoding="utf-8")
+    dependencies = Mock()
+    monkeypatch.setattr(install_mod, "_install_dependencies", dependencies)
+    installed = tmp_path / "installed"
+    with pytest.raises(InstallError, match="project.dependencies must be a list of strings"):
+        install_mod.install(str(source), plugins_dir=installed)
+    dependencies.assert_not_called()
+    assert list(installed.iterdir()) == []
+
+
 def test_detect_package_manager_returns_string():
     """_detect_package_manager returns 'uv', 'pip', or None."""
     from pymss.plugins.install import _detect_package_manager
@@ -644,7 +766,7 @@ def test_update_rejects_changed_identity_before_installing_dependencies(installe
     assert list(destination.parent.iterdir()) == [destination]
 
 
-@pytest.mark.parametrize("failure", ["manifest", "dependencies"])
+@pytest.mark.parametrize("failure", ["manifest", "metadata", "dependencies"])
 def test_update_preparation_failure_preserves_original(installed_update, monkeypatch, failure):
     from pymss.plugins import install as install_mod
 
@@ -655,6 +777,11 @@ def test_update_preparation_failure_preserves_original(installed_update, monkeyp
     if failure == "manifest":
         (source / "pyproject.toml").write_text("tool = []\n")
         message = "not a pymss v2 plugin"
+    elif failure == "metadata":
+        (source / "pyproject.toml").write_text(
+            _manifest("author.updated", "0.2.0").replace('[project]\n', '[project]\ndependencies = ["numpy", 1]\n')
+        )
+        message = "project.dependencies must be a list of strings"
     else:
         (source / "pyproject.toml").write_text(
             _manifest("author.updated", "0.2.0").replace('[project]\n', '[project]\ndependencies = ["dependency>=2"]\n')
@@ -663,7 +790,7 @@ def test_update_preparation_failure_preserves_original(installed_update, monkeyp
         dependencies.side_effect = InstallError(message)
     with pytest.raises(InstallError, match=message):
         install_mod.update("author.updated", plugins_dir=destination.parent)
-    if failure == "manifest":
+    if failure in {"manifest", "metadata"}:
         dependencies.assert_not_called()
     else:
         dependencies.assert_called_once_with(["dependency>=2"])
@@ -712,3 +839,42 @@ def test_update_replaces_plugin_and_cleans_staging(installed_update, monkeypatch
     assert json.loads((destination / ".pymss-install.json").read_text())["version"] == "0.2.0"
     dependencies.assert_called_once_with([])
     assert list(destination.parent.iterdir()) == [destination]
+
+
+def test_update_preserves_marked_dependencies(installed_update, monkeypatch, marked_dependencies):
+    from pymss.plugins import install as install_mod
+
+    source, destination = installed_update
+    text = _manifest("author.updated", "0.2.0").replace(
+        '[project]\n', '[project]\ndependencies = ' + json.dumps(marked_dependencies) + '\n',
+    )
+    (source / "pyproject.toml").write_text(text, encoding="utf-8")
+    dependencies = Mock()
+    monkeypatch.setattr(install_mod, "_install_dependencies", dependencies)
+    result = install_mod.update("author.updated", plugins_dir=destination.parent)
+    dependencies.assert_called_once_with(marked_dependencies)
+    assert result.dependencies_installed == marked_dependencies
+    assert result.version == "0.2.0"
+    assert list(destination.parent.iterdir()) == [destination]
+
+
+@pytest.mark.parametrize("content", [b"[project", b"project = []", b"\xff\xfe"])
+def test_check_update_reports_malformed_remote_metadata(installed_update, monkeypatch, content):
+    from pymss.plugins import install as install_mod
+
+    _, destination = installed_update
+    record_path = destination / ".pymss-install.json"
+    record = json.loads(record_path.read_text())
+    record.update(source="url", url="https://github.com/owner/plugin", subpath="plugins/audio")
+    record_path.write_text(json.dumps(record))
+    previous = _plugin_files(destination)
+    commit = "a" * 40
+    resolve = Mock(return_value=commit)
+    read = Mock(return_value=content)
+    monkeypatch.setattr(install_mod, "resolve_github_commit", resolve)
+    monkeypatch.setattr(install_mod, "read_github_file", read)
+    with pytest.raises(InstallError):
+        install_mod.check_update("author.updated", plugins_dir=destination.parent)
+    resolve.assert_called_once_with("https://github.com/owner/plugin", None)
+    read.assert_called_once_with("https://github.com/owner/plugin", "plugins/audio/pyproject.toml", commit=commit)
+    assert _plugin_files(destination) == previous

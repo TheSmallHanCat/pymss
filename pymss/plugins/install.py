@@ -18,11 +18,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -137,34 +137,36 @@ def _clone(url: str, dest: Path, subpath: str | None = None, ref: str | None = N
 # Plugin metadata (read from pyproject.toml) and dependency installation
 # ---------------------------------------------------------------------------
 
-_PYPROJECT_NAME_RE = re.compile(r'^name\s*=\s*["\']([^"\']+)', re.M)
-_PYPROJECT_VERSION_RE = re.compile(r'^version\s*=\s*["\']([^"\']+)', re.M)
-_PYPROJECT_DEPS_RE = re.compile(r'dependencies\s*=\s*\[(.*?)\]', re.S | re.M)
-
-
 def _read_plugin_meta(plugin_dir: Path) -> dict:
     """Read name/version/dependencies from a plugin's pyproject.toml.
 
-    Uses a regex-based parse (no tomllib needed for this simple shape, and
-    stays compatible with Python 3.10 which has tomllib only in 3.11+).
     Returns {} if no pyproject.toml is present.
     """
     pp = plugin_dir / "pyproject.toml"
     if not pp.exists():
         return {}
-    return _parse_plugin_meta(pp.read_text(encoding="utf-8"))
+    try:
+        text = pp.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise InstallError(f"cannot read pyproject.toml: {exc}") from exc
+    return _parse_plugin_meta(text)
 
 
 def _parse_plugin_meta(txt: str) -> dict:
-    meta = {}
-    if m := _PYPROJECT_NAME_RE.search(txt):
-        meta["name"] = m.group(1)
-    if m := _PYPROJECT_VERSION_RE.search(txt):
-        meta["version"] = m.group(1)
-    if m := _PYPROJECT_DEPS_RE.search(txt):
-        deps_raw = m.group(1)
-        deps = re.findall(r'["\']([^"\']+)["\']', deps_raw)
-        meta["dependencies"] = [d for d in deps if d.lower() != "pymss"]
+    try:
+        data = tomllib.loads(txt)
+    except tomllib.TOMLDecodeError as exc:
+        raise InstallError(f"invalid pyproject.toml: {exc}") from exc
+    project = data.get("project", {})
+    if not isinstance(project, dict):
+        raise InstallError("project must be a TOML table")
+    meta = {key: project[key] for key in ("name", "version") if isinstance(project.get(key), str)}
+    if "dependencies" in project:
+        dependencies = project["dependencies"]
+        if not isinstance(dependencies, list) or not all(isinstance(item, str) for item in dependencies):
+            raise InstallError("project.dependencies must be a list of strings")
+        # Preserve requirement strings, including markers and extras, for pip/uv.
+        meta["dependencies"] = [item for item in dependencies if item.lower() != "pymss"]
     return meta
 
 
