@@ -11,6 +11,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from pymss._builtin_node_types import BUILTIN_NODE_TYPES
 from pymss.plugins import (
     CapabilityNotFound,
     bootstrap,
@@ -45,6 +46,7 @@ def _reset_registry():
     reg.nodes.clear()
     reg.cli_commands.clear()
     reg._reserved_node_types.clear()
+    reg._reserved_node_types.update(BUILTIN_NODE_TYPES)
     reset()
     from pymss.plugins.builtins import register_builtin_capabilities
     from pymss.plugins.codecs import register_builtin_codecs
@@ -56,6 +58,7 @@ def _reset_registry():
     reg.nodes.clear()
     reg.cli_commands.clear()
     reg._reserved_node_types.clear()
+    reg._reserved_node_types.update(BUILTIN_NODE_TYPES)
     reset()
     register_builtin_capabilities()
     register_builtin_codecs()
@@ -104,10 +107,11 @@ def test_reserved_node_cannot_be_overridden_by_plugin():
 def test_reserved_node_allows_builtin_override():
     reg = get_registry()
     reg.reserve_node_type("mss_separate")
-    # pymss core itself can register reserved nodes with the internal flag.
-    reg.register_node(
-        "mss_separate", lambda ctx, inputs: None, source="builtin", allow_override_builtin=True
-    )
+    # Only the trusted core initialization boundary can register reserved nodes.
+    with reg._builtin_registration():
+        reg.register_node(
+            "mss_separate", lambda ctx, inputs: None, source="builtin", allow_override_builtin=True
+        )
     assert reg.get_node("mss_separate") is not None
 
 
