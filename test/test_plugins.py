@@ -33,35 +33,44 @@ from pymss.plugins.install import InstallError, install, uninstall
 
 @pytest.fixture(autouse=True)
 def _reset_registry():
-    """Each test starts with a clean registry and loader cache.
-
-    Clearing only user registrations is not possible (registrations carry no
-    owner scope), so clear everything and restore the builtin registrations a
-    fresh process would have. Without the restore, tests that assert on the
-    builtin codec/DSP capabilities see an empty registry once this module has
-    run once (the autouse fixture leaks the cleared state across modules).
-    """
-    reg = get_registry()
-    reg.capabilities.clear()
-    reg.nodes.clear()
-    reg.cli_commands.clear()
-    reg._reserved_node_types.clear()
-    reg._reserved_node_types.update(BUILTIN_NODE_TYPES)
-    reset()
+    """Isolate each plugin test without invalidating other modules' graph cache."""
+    import pymss.operations as operations
+    from pymss.graph.core import _load_builtin_nodes
+    from pymss.plugins import loader
     from pymss.plugins.builtins import register_builtin_capabilities
     from pymss.plugins.codecs import register_builtin_codecs
 
-    register_builtin_capabilities()
-    register_builtin_codecs()
-    yield
-    reg.capabilities.clear()
-    reg.nodes.clear()
-    reg.cli_commands.clear()
-    reg._reserved_node_types.clear()
-    reg._reserved_node_types.update(BUILTIN_NODE_TYPES)
-    reset()
-    register_builtin_capabilities()
-    register_builtin_codecs()
+    # Python keeps imported graph modules cached. Snapshot their registrations
+    # before clearing the test registry, then restore the same entry identities.
+    _load_builtin_nodes()
+    reg = get_registry()
+    snapshots = [
+        (reg.capabilities, dict(reg.capabilities)),
+        (reg.nodes, dict(reg.nodes)),
+        (reg._reserved_node_types, set(reg._reserved_node_types)),
+        (reg._builtin_registrations, dict(reg._builtin_registrations)),
+    ]
+    commands = list(reg.cli_commands)
+    depth = reg._builtin_registration_depth
+    runtime, report = operations._DEFAULT_RUNTIME, loader._LAST_REPORT
+    try:
+        for current, _before in snapshots:
+            current.clear()
+        reg.cli_commands.clear()
+        reg._builtin_registration_depth = 0
+        reg._reserved_node_types.update(BUILTIN_NODE_TYPES)
+        operations._DEFAULT_RUNTIME = None
+        reset()
+        register_builtin_capabilities()
+        register_builtin_codecs()
+        yield
+    finally:
+        for current, before in snapshots:
+            current.clear()
+            current.update(before)
+        reg.cli_commands[:] = commands
+        reg._builtin_registration_depth = depth
+        operations._DEFAULT_RUNTIME, loader._LAST_REPORT = runtime, report
 
 
 def test_register_capability_direct():
